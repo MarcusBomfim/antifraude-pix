@@ -1,4 +1,4 @@
-"""A linha de comando: `antifraude-pix simular` gera os dados, e `antifraude-pix validar` os confere."""
+"""A linha de comando: `simular` gera os dados, `validar` os confere, e `variaveis` calcula as variáveis de cada Pix."""
 
 import argparse
 import sys
@@ -7,11 +7,13 @@ from collections.abc import Sequence
 from datetime import date
 from pathlib import Path
 
-from antifraude_pix.dados.gravacao import gravar, ler
+from antifraude_pix.dados.gravacao import gravar, ler, ler_o_banco
 from antifraude_pix.dados.validacao import problemas
 from antifraude_pix.simulacao.configuracao import Configuracao
 from antifraude_pix.simulacao.golpes import NOMES, Golpe
 from antifraude_pix.simulacao.simulador import Simulacao, simular
+from antifraude_pix.variaveis.calculo import calcular
+from antifraude_pix.variaveis.catalogo import CATALOGO
 
 
 def principal(argumentos: Sequence[str] | None = None) -> int:
@@ -23,6 +25,9 @@ def principal(argumentos: Sequence[str] | None = None) -> int:
 
     if pedido.comando == "simular":
         return _simular(pedido)
+
+    if pedido.comando == "variaveis":
+        return _variaveis(pedido.pasta, pedido.saida)
 
     return _validar(pedido.pasta)
 
@@ -56,6 +61,16 @@ def _leitor() -> argparse.ArgumentParser:
 
     validar = comandos.add_parser("validar", help="confere os dados gravados numa pasta")
     validar.add_argument("pasta", type=Path, nargs="?", default=Path("dados"), help="a pasta dos dados (padrão: dados)")
+
+    variaveis = comandos.add_parser(
+        "variaveis", help="calcula as variáveis de cada Pix, só com o que o banco sabia antes dele"
+    )
+    variaveis.add_argument(
+        "pasta", type=Path, nargs="?", default=Path("dados"), help="a pasta dos dados (padrão: dados)"
+    )
+    variaveis.add_argument(
+        "--saida", type=Path, help="o arquivo das variáveis (padrão: variaveis.parquet, na pasta dos dados)"
+    )
 
     return leitor
 
@@ -103,6 +118,27 @@ def _validar(pasta: Path) -> int:
 
     print(_resumo(simulacao))
     print("Os dados seguem o contrato.")
+
+    return 0
+
+
+def _variaveis(pasta: Path, saida: Path | None) -> int:
+    """Lê só o que o banco vê, calcula as variáveis e as grava em Parquet, ao lado dos dados."""
+    try:
+        visao = ler_o_banco(pasta)
+    except (OSError, ValueError, KeyError) as erro:
+        print(f"antifraude-pix variaveis: não consegui ler {pasta}: {erro}", file=sys.stderr)
+        return 1
+
+    comeco = time.perf_counter()
+    destino = saida or pasta / "variaveis.parquet"
+    destino.parent.mkdir(parents=True, exist_ok=True)
+    calcular(visao).write_parquet(destino, compression="zstd")
+
+    print(
+        f"{_numero(len(CATALOGO))} variáveis de {_numero(visao.transacoes.height)} Pix, "
+        f"gravadas em {destino}, em {_numero(round(time.perf_counter() - comeco))} s."
+    )
 
     return 0
 

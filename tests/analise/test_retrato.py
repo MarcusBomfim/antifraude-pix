@@ -70,5 +70,11 @@ def test_os_rotulos_proximos_se_afastam_sem_mudar_de_ordem() -> None:
 def test_as_figuras_sao_gravadas_em_png(simulacao: Simulacao, tmp_path: Path) -> None:
     gravadas = figuras.gerar(simulacao, tmp_path)
 
-    assert [figura.name for figura in gravadas] == ["horas.png", "valores.png", "contestacao.png", "recebedores.png"]
+    assert [figura.name for figura in gravadas] == [
+        "horas.png",
+        "valores.png",
+        "contestacao.png",
+        "recebedores.png",
+        "separacao.png",
+    ]
     assert all(figura.read_bytes().startswith(b"\x89PNG") for figura in gravadas)

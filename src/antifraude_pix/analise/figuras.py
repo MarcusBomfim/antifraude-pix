@@ -2,7 +2,9 @@
 
 As cores seguem o golpe em todas as figuras — o falso parente é sempre azul —,
 e o Pix legítimo é sempre o cinza neutro. Cada série tem o nome escrito ao
-lado dela ou no título do quadro: a cor ajuda, mas nunca está sozinha.
+lado dela ou no título do quadro: a cor ajuda, mas nunca está sozinha. Na
+tabela da força das variáveis, o azul vai do claro ao escuro, e o número está
+escrito em cada casa.
 """
 
 from pathlib import Path
@@ -10,13 +12,18 @@ from typing import Any
 
 import matplotlib as mpl
 import polars as pl
+from matplotlib.colors import LinearSegmentedColormap
 from matplotlib.figure import Figure
 from matplotlib.layout_engine import ConstrainedLayoutEngine
+from matplotlib.patches import Rectangle
 from matplotlib.ticker import FuncFormatter, MultipleLocator
 
-from antifraude_pix.analise import retrato
+from antifraude_pix.analise import retrato, separacao
+from antifraude_pix.dados.banco import VisaoDoBanco
 from antifraude_pix.simulacao.golpes import GOLPES, NOMES, Golpe
 from antifraude_pix.simulacao.simulador import Simulacao
+from antifraude_pix.variaveis.calculo import calcular
+from antifraude_pix.variaveis.catalogo import CATALOGO
 
 SUPERFICIE = "#fcfcfb"
 TINTA = "#0b0b0b"
@@ -35,6 +42,25 @@ CORES: dict[str, str] = {
     "comércio": "#6250d6",
     "conta laranja": "#e34948",
 }
+
+AZUIS = (
+    "#cde2fb", "#b7d3f6", "#9ec5f4", "#86b6ef", "#6da7ec", "#5598e7", "#3987e5",
+    "#2a78d6", "#256abf", "#1c5cab", "#184f95", "#104281", "#0d366b",
+)  # fmt: skip
+"""A escala do azul, do claro ao escuro: a força que vai de 0,5, não separar nada, a 1, separar tudo."""
+
+_COM_ACENTO = {
+    "pix": "Pix",
+    "pj": "é empresa",
+    "ultima": "última",
+    "ultimas": "últimas",
+    "ultimo": "último",
+    "contestacoes": "contestações",
+}
+"""Os nomes das variáveis são identificadores, sem acento; na figura, cada um se escreve como se lê."""
+
+_BRANCO_A_PARTIR_DE = 7 / 12
+"""Do sétimo azul em diante, o número da casa é branco: no claro, a tinta escura se lê melhor."""
 
 _ESTILO: dict[Any, Any] = {
     "font.family": ["Segoe UI", "DejaVu Sans", "sans-serif"],
@@ -69,14 +95,21 @@ def _reais(valor: float, _: object = None) -> str:
     return "R$ " + f"{valor:,.0f}".replace(",", ".")
 
 
-def _espaco_para_o_titulo(topo: float) -> ConstrainedLayoutEngine:
-    """O arranjo automático dos quadros, deixando o alto da figura para o título e o subtítulo."""
-    return ConstrainedLayoutEngine(rect=(0, 0, 1, topo))
+# O alto de toda figura, em polegadas: o título, o subtítulo, e onde começam os quadros.
+_TITULO = 0.12
+_SUBTITULO = 0.44
+_QUADROS = 0.78
+
+
+def _figura(altura: float) -> Figure:
+    """Uma figura da largura do README, com o arranjo automático dos quadros abaixo do título e do subtítulo."""
+    return Figure(figsize=(10, altura), layout=ConstrainedLayoutEngine(rect=(0, 0, 1, 1 - _QUADROS / altura)))
 
 
 def _titulo(figura: Figure, titulo: str, subtitulo: str) -> None:
-    figura.text(0.012, 0.975, titulo, fontsize=14, fontweight="bold", color=TINTA, va="top")
-    figura.text(0.012, 0.915, subtitulo, fontsize=10, color=TINTA_SECUNDARIA, va="top")
+    altura = figura.get_figheight()
+    figura.text(0.012, 1 - _TITULO / altura, titulo, fontsize=14, fontweight="bold", color=TINTA, va="top")
+    figura.text(0.012, 1 - _SUBTITULO / altura, subtitulo, fontsize=10, color=TINTA_SECUNDARIA, va="top")
 
 
 def horas(simulacao: Simulacao) -> Figure:
@@ -85,7 +118,7 @@ def horas(simulacao: Simulacao) -> Figure:
     legitimo = tabela.filter(pl.col("grupo") == retrato.LEGITIMO)
 
     with mpl.rc_context(_ESTILO):
-        figura = Figure(figsize=(10, 6.2), layout=_espaco_para_o_titulo(0.86))
+        figura = _figura(6.2)
         quadros = figura.subplots(2, 2, sharex=True, sharey=True)
 
         for quadro, golpe in zip(quadros.ravel(), GOLPES, strict=True):
@@ -116,7 +149,7 @@ def valores(simulacao: Simulacao) -> Figure:
     tabela = retrato.faixas_de_valor(simulacao)
 
     with mpl.rc_context(_ESTILO):
-        figura = Figure(figsize=(10, 4.2), layout=_espaco_para_o_titulo(0.8))
+        figura = _figura(4.2)
         quadro = figura.subplots()
         nomes = tabela["grupo"].to_list()
 
@@ -155,7 +188,7 @@ def contestacao(simulacao: Simulacao) -> Figure:
     tabela = retrato.demora_da_contestacao(simulacao)
 
     with mpl.rc_context(_ESTILO):
-        figura = Figure(figsize=(10, 4.8), layout=_espaco_para_o_titulo(0.84))
+        figura = _figura(4.8)
         quadro = figura.subplots()
 
         finais = {}
@@ -191,7 +224,7 @@ def recebedores(simulacao: Simulacao) -> Figure:
     largura = 0.26
 
     with mpl.rc_context(_ESTILO):
-        figura = Figure(figsize=(10, 4.6), layout=_espaco_para_o_titulo(0.82))
+        figura = _figura(4.6)
         quadro = figura.subplots()
 
         for indice, tipo in enumerate(tipos):
@@ -215,6 +248,83 @@ def recebedores(simulacao: Simulacao) -> Figure:
     return figura
 
 
+def forca_das_variaveis(simulacao: Simulacao) -> Figure:
+    """A força de cada variável, sozinha, contra cada golpe: uma tabela de calor, com os grupos do catálogo."""
+    tabela = separacao.forcas(simulacao, calcular(VisaoDoBanco.da(simulacao)))
+    forca = {(variavel, golpe): valor for variavel, golpe, valor in tabela.iter_rows()}
+    escala = LinearSegmentedColormap.from_list("azuis", AZUIS)
+
+    # Uma linha para o nome de cada grupo e uma para cada variável dele.
+    linhas: list[tuple[str, bool]] = []
+
+    for variavel in CATALOGO:
+        if variavel.nome not in separacao.ANALISADAS:
+            continue
+
+        titulo = variavel.grupo.value[0].upper() + variavel.grupo.value[1:]
+
+        if (titulo, True) not in linhas:
+            linhas.append((titulo, True))
+
+        linhas.append((variavel.nome, False))
+
+    with mpl.rc_context(_ESTILO):
+        figura = _figura(10.5)
+        quadro = figura.subplots()
+
+        for y, (nome, e_grupo) in enumerate(linhas):
+            if e_grupo:
+                continue
+
+            for x, golpe in enumerate(GOLPES):
+                valor = forca[nome, golpe.value]
+                tom = (valor - 0.5) / 0.5
+                quadro.add_patch(
+                    Rectangle((x - 0.5, y - 0.5), 1, 1, facecolor=escala(tom), edgecolor=SUPERFICIE, linewidth=2)
+                )
+                quadro.text(
+                    x,
+                    y,
+                    f"{valor:.2f}".replace(".", ","),
+                    ha="center",
+                    va="center",
+                    fontsize=9,
+                    color=SUPERFICIE if tom >= _BRANCO_A_PARTIR_DE else TINTA,
+                )
+
+        quadro.set_xlim(-0.5, len(GOLPES) - 0.5)
+        quadro.set_ylim(len(linhas) - 0.5, -0.5)
+        quadro.xaxis.tick_top()
+        quadro.set_xticks(range(len(GOLPES)), [NOMES[golpe][0].upper() + NOMES[golpe][1:] for golpe in GOLPES])
+        quadro.set_yticks(range(len(linhas)), ["" if e_grupo else _rotulo(nome) for nome, e_grupo in linhas])
+
+        # O nome do grupo vai sobre as casas, na linha vazia que abre o grupo.
+        for y, (nome, e_grupo) in enumerate(linhas):
+            if e_grupo:
+                quadro.text(-0.48, y + 0.15, nome, ha="left", va="center", fontsize=10, fontweight="bold", color=TINTA)
+
+        quadro.tick_params(length=0)
+        quadro.tick_params(axis="y", labelcolor=TINTA_SECUNDARIA)
+        quadro.tick_params(axis="x", labelcolor=TINTA)
+        quadro.grid(visible=False)
+
+        for lado in quadro.spines.values():
+            lado.set_visible(False)
+
+        _titulo(
+            figura,
+            "O que cada variável, sozinha, separa",
+            "A área sob a curva ROC de cada variável, contra o Pix legítimo: 0,5 é não separar nada; 1, separar tudo.",
+        )
+
+    return figura
+
+
+def _rotulo(nome: str) -> str:
+    """O nome da variável como se lê: `pix_na_ultima_hora` vira "Pix na última hora"."""
+    return " ".join(_COM_ACENTO.get(palavra, palavra) for palavra in nome.split("_"))
+
+
 def _afastados(alturas: dict[str, float], distancia: float) -> dict[str, float]:
     """As alturas dos rótulos, de baixo para cima, cada uma ao menos a distância dada da anterior."""
     resultado: dict[str, float] = {}
@@ -227,7 +337,13 @@ def _afastados(alturas: dict[str, float], distancia: float) -> dict[str, float]:
     return resultado
 
 
-FIGURAS = {"horas": horas, "valores": valores, "contestacao": contestacao, "recebedores": recebedores}
+FIGURAS = {
+    "horas": horas,
+    "valores": valores,
+    "contestacao": contestacao,
+    "recebedores": recebedores,
+    "separacao": forca_das_variaveis,
+}
 
 
 def gerar(simulacao: Simulacao, pasta: Path) -> list[Path]:
