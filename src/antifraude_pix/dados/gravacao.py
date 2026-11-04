@@ -28,6 +28,7 @@ from typing import Any
 
 import polars as pl
 
+from antifraude_pix.dados.banco import VisaoDoBanco
 from antifraude_pix.dados.esquema import DA_VERDADE, DO_BANCO
 from antifraude_pix.simulacao.configuracao import Configuracao
 from antifraude_pix.simulacao.simulador import Simulacao, Verdade
@@ -66,14 +67,7 @@ def gravar(simulacao: Simulacao, pasta: Path) -> dict[str, Any]:
 
 def ler(pasta: Path) -> Simulacao:
     """Lê a simulação gravada, conferindo cada arquivo pelo SHA-256 do manifesto."""
-    manifesto = json.loads((pasta / MANIFESTO).read_text(encoding="utf-8"))
-
-    if manifesto["formato"] != FORMATO:
-        raise ValueError(f"A pasta {pasta} está no formato {manifesto['formato']}, e este simulador lê o {FORMATO}.")
-
-    for caminho, dados in manifesto["tabelas"].items():
-        if hashlib.sha256((pasta / caminho).read_bytes()).hexdigest() != dados["sha256"]:
-            raise ValueError(f"O arquivo {caminho} mudou depois de gravado: o SHA-256 não é o do manifesto.")
+    manifesto = _manifesto_conferido(pasta, ate_a_verdade=True)
 
     configuracao = dict(manifesto["configuracao"])
     configuracao["inicio"] = date.fromisoformat(configuracao["inicio"])
@@ -93,6 +87,33 @@ def ler(pasta: Path) -> Simulacao:
             laranjas=tabela(VERDADE, "laranjas"),
         ),
     )
+
+
+def ler_o_banco(pasta: Path) -> VisaoDoBanco:
+    """Lê só o que o banco vê: a pasta da verdade nem é aberta (ADR-0005)."""
+    _manifesto_conferido(pasta, ate_a_verdade=False)
+
+    return VisaoDoBanco(**{nome: pl.read_parquet(pasta / BANCO / f"{nome}.parquet") for nome in DO_BANCO})
+
+
+def _manifesto_conferido(pasta: Path, *, ate_a_verdade: bool) -> dict[str, Any]:
+    """O manifesto da pasta, conferidos o formato e o SHA-256 de cada arquivo.
+
+    Os arquivos da verdade só são conferidos quando vão ser lidos.
+    """
+    manifesto: dict[str, Any] = json.loads((pasta / MANIFESTO).read_text(encoding="utf-8"))
+
+    if manifesto["formato"] != FORMATO:
+        raise ValueError(f"A pasta {pasta} está no formato {manifesto['formato']}, e este simulador lê o {FORMATO}.")
+
+    for caminho, dados in manifesto["tabelas"].items():
+        if not ate_a_verdade and not caminho.startswith(f"{BANCO}/"):
+            continue
+
+        if hashlib.sha256((pasta / caminho).read_bytes()).hexdigest() != dados["sha256"]:
+            raise ValueError(f"O arquivo {caminho} mudou depois de gravado: o SHA-256 não é o do manifesto.")
+
+    return manifesto
 
 
 def _do_banco(simulacao: Simulacao) -> dict[str, pl.DataFrame]:

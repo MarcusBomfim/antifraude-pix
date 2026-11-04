@@ -83,6 +83,9 @@ GOLPES_POR_LARANJA = 6
 É recebendo de muitas vítimas, em poucos dias, que ela se denuncia.
 """
 
+LARANJAS_DE_FACHADA = 0.2
+"""A parte das contas laranja que é de empresa: o MEI aberto para receber golpe."""
+
 SALARIO_MINIMO = 151_800
 """O salário mínimo de 2025, em centavos: o piso da renda dos clientes."""
 
@@ -163,14 +166,12 @@ def gerar_populacao(config: Configuracao) -> Populacao:
     comercios = _contas(
         gerador, contas, TipoDePessoa.JURIDICA, max(20, config.clientes // 8), _CHAVES_DE_COMERCIO, laranja=False
     )
+    # A laranja é quase sempre uma pessoa; uma em cada cinco é uma empresa de fachada, um MEI aberto para isso.
+    quantas_laranjas = max(5, round(ataques_esperados(config) / GOLPES_POR_LARANJA))
+    de_fachada = round(quantas_laranjas * LARANJAS_DE_FACHADA)
     contas_laranja = _contas(
-        gerador,
-        contas,
-        TipoDePessoa.FISICA,
-        max(5, round(ataques_esperados(config) / GOLPES_POR_LARANJA)),
-        _CHAVES_DE_LARANJA,
-        laranja=True,
-    )
+        gerador, contas, TipoDePessoa.FISICA, quantas_laranjas - de_fachada, _CHAVES_DE_LARANJA, laranja=True
+    ) + _contas(gerador, contas, TipoDePessoa.JURIDICA, de_fachada, _CHAVES_DE_COMERCIO, laranja=True)
 
     laranjas = tuple(_laranja(gerador, config, conta) for conta in contas_laranja)
     popularidade = _popularidade(len(comercios))

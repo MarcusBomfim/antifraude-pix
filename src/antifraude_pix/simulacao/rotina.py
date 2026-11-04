@@ -44,15 +44,24 @@ class Categoria(IntEnum):
     PESSOA_NOVA = 3
     GRANDE = 4
     """O Pix grande e raro: o carro usado, a reforma, o conserto — quase sempre para alguém novo."""
+    SERVICO = 5
+    """O autônomo: a diarista, o eletricista, o frete.
+
+    Uma pessoa nova, de dia, em valor redondo: como no falso parente.
+    """
+    AJUDA_DA_FAMILIA = 6
+    """Os pais ajudando o filho, o filho ajudando a mãe: um contato, em valor redondo, às vezes alto."""
 
 
 # A chance de cada categoria num Pix comum.
 CHANCES: dict[Categoria, float] = {
-    Categoria.COMERCIO_HABITUAL: 0.53,
-    Categoria.CONTATO: 0.25,
+    Categoria.COMERCIO_HABITUAL: 0.50,
+    Categoria.CONTATO: 0.23,
     Categoria.COMERCIO_NOVO: 0.09,
-    Categoria.PESSOA_NOVA: 0.124,
+    Categoria.PESSOA_NOVA: 0.10,
     Categoria.GRANDE: 0.006,
+    Categoria.SERVICO: 0.05,
+    Categoria.AJUDA_DA_FAMILIA: 0.024,
 }
 
 # O valor típico de cada categoria, em centavos, e o quanto ele varia (o desvio do logaritmo).
@@ -65,57 +74,13 @@ VALORES: dict[Categoria, tuple[int, float]] = {
 
 # As horas de cada categoria: o comércio no almoço e no fim do dia; as pessoas a qualquer hora, um pouco de madrugada.
 _COMERCIO = (
-    0.2,
-    0.1,
-    0.05,
-    0.05,
-    0.05,
-    0.1,
-    0.3,
-    0.8,
-    1.2,
-    1.4,
-    1.6,
-    2.0,
-    2.6,
-    2.2,
-    1.6,
-    1.4,
-    1.5,
-    1.8,
-    2.3,
-    2.6,
-    2.4,
-    1.8,
-    1.0,
-    0.5,
-)
+    0.2, 0.1, 0.05, 0.05, 0.05, 0.1, 0.3, 0.8, 1.2, 1.4, 1.6, 2.0,
+    2.6, 2.2, 1.6, 1.4, 1.5, 1.8, 2.3, 2.6, 2.4, 1.8, 1.0, 0.5,
+)  # fmt: skip
 _PESSOAS = (
-    0.6,
-    0.3,
-    0.2,
-    0.1,
-    0.1,
-    0.2,
-    0.5,
-    0.9,
-    1.2,
-    1.4,
-    1.5,
-    1.6,
-    1.7,
-    1.6,
-    1.5,
-    1.5,
-    1.6,
-    1.8,
-    2.0,
-    2.2,
-    2.2,
-    2.0,
-    1.6,
-    1.0,
-)
+    0.6, 0.3, 0.2, 0.1, 0.1, 0.2, 0.5, 0.9, 1.2, 1.4, 1.5, 1.6,
+    1.7, 1.6, 1.5, 1.5, 1.6, 1.8, 2.0, 2.2, 2.2, 2.0, 1.6, 1.0,
+)  # fmt: skip
 _HORARIO_COMERCIAL = tuple(1.0 if 9 <= hora < 18 else 0.05 for hora in range(24))
 HORAS: dict[Categoria, tuple[float, ...]] = {
     Categoria.COMERCIO_HABITUAL: _COMERCIO,
@@ -123,6 +88,8 @@ HORAS: dict[Categoria, tuple[float, ...]] = {
     Categoria.CONTATO: _PESSOAS,
     Categoria.PESSOA_NOVA: _PESSOAS,
     Categoria.GRANDE: _HORARIO_COMERCIAL,
+    Categoria.SERVICO: _HORARIO_COMERCIAL,
+    Categoria.AJUDA_DA_FAMILIA: _PESSOAS,
 }
 
 # Como cada categoria inicia o Pix: o comércio pelo QR Code; as pessoas pela
@@ -133,6 +100,8 @@ INICIACOES: dict[Categoria, tuple[tuple[Iniciacao, float], ...]] = {
     Categoria.CONTATO: ((Iniciacao.CHAVE, 0.9), (Iniciacao.MANUAL, 0.1)),
     Categoria.PESSOA_NOVA: ((Iniciacao.CHAVE, 0.85), (Iniciacao.QR_CODE, 0.1), (Iniciacao.MANUAL, 0.05)),
     Categoria.GRANDE: ((Iniciacao.CHAVE, 0.7), (Iniciacao.MANUAL, 0.3)),
+    Categoria.SERVICO: ((Iniciacao.CHAVE, 0.9), (Iniciacao.MANUAL, 0.1)),
+    Categoria.AJUDA_DA_FAMILIA: ((Iniciacao.CHAVE, 0.9), (Iniciacao.MANUAL, 0.1)),
 }
 
 
@@ -342,7 +311,7 @@ def _pix_comuns(
     recebedores = np.select(
         [
             categorias == Categoria.COMERCIO_HABITUAL,
-            categorias == Categoria.CONTATO,
+            (categorias == Categoria.CONTATO) | (categorias == Categoria.AJUDA_DA_FAMILIA),
             categorias == Categoria.COMERCIO_NOVO,
         ],
         [
@@ -404,6 +373,24 @@ def _valores(gerador: np.random.Generator, categoria: Categoria, escala: float, 
         # De R$ 1.500 a R$ 15.000, em valor redondo: quem compra um carro usado não manda centavos.
         grandes = np.exp(gerador.uniform(np.log(150_000), np.log(1_500_000), size=quantos)) * escala
         return np.maximum(10_000, np.round(grandes, -4)).astype(np.int64)
+
+    if categoria is Categoria.SERVICO:
+        # Por volta de R$ 250, de R$ 100 a R$ 1.000 quase sempre, e três em quatro redondos: o preço combinado.
+        servicos = np.exp(gerador.normal(np.log(25_000), 0.6, size=quantos)) * escala**0.5
+        redondos = gerador.random(quantos) < 0.75
+        valores_de_servico: npt.NDArray[np.int64] = np.where(
+            redondos, np.maximum(1_000, np.round(servicos, -3)), np.round(servicos)
+        ).astype(np.int64)
+        return valores_de_servico
+
+    if categoria is Categoria.AJUDA_DA_FAMILIA:
+        # De R$ 200 a R$ 2.000, quase sempre redondo: a ajuda com o aluguel, com o remédio.
+        ajudas = np.exp(gerador.uniform(np.log(20_000), np.log(200_000), size=quantos)) * escala**0.5
+        redondos = gerador.random(quantos) < 0.85
+        valores_de_ajuda: npt.NDArray[np.int64] = np.where(
+            redondos, np.maximum(1_000, np.round(ajudas, -3)), np.round(ajudas)
+        ).astype(np.int64)
+        return valores_de_ajuda
 
     tipico, desvio = VALORES[categoria]
     valores = np.maximum(100, np.round(np.exp(gerador.normal(np.log(tipico), desvio, size=quantos)) * escala))

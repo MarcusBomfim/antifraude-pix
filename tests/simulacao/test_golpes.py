@@ -117,12 +117,20 @@ def test_os_passos_sao_os_mesmos_para_o_mesmo_ataque_e_em_ordem(ataques: tuple[A
 
 
 def test_o_falso_parente_pede_valores_redondos_que_diminuem(ataques: tuple[Ataque, ...]) -> None:
+    primeiros = []
+
     for ataque in _do_golpe(ataques, Golpe.FALSO_PARENTE):
         valores = [passo.valor for passo in passos(MEDIA, ataque)]
 
         assert 1 <= len(valores) <= 3
         assert all(valor is not None and valor % 1_000 == 0 for valor in valores)
         assert valores == sorted(valores, key=lambda valor: -(valor or 0))
+        primeiros.append(valores[0] or 0)
+
+    # O primeiro pedido vai de R$ 150 a R$ 3.000, e o pequeno é comum: "é só pra pagar uma conta que venceu hoje".
+    assert min(primeiros) >= 15_000
+    assert max(primeiros) <= 300_000
+    assert sum(primeiro < 40_000 for primeiro in primeiros) / len(primeiros) > 0.15
 
 
 def test_a_falsa_central_e_a_invasao_levam_partes_do_saldo(ataques: tuple[Ataque, ...]) -> None:

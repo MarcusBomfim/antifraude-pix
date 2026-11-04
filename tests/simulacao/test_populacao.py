@@ -82,17 +82,24 @@ def test_cada_tipo_de_conta_recebe_pela_chave_que_lhe_cabe(populacao: Populacao)
         assert (conta.pessoa, conta.chave in {TipoDeChave.CNPJ, TipoDeChave.ALEATORIA}) == (TipoDePessoa.JURIDICA, True)
 
 
-def test_a_laranja_e_pessoa_fisica_ativa_de_dois_a_vinte_dias_dentro_da_simulacao(populacao: Populacao) -> None:
+def test_a_laranja_fica_ativa_de_dois_a_vinte_dias_dentro_da_simulacao(populacao: Populacao) -> None:
     # Uma laranja para cada seis golpes esperados, e pelo menos cinco.
     assert len(populacao.laranjas) == max(5, round(ataques_esperados(PEQUENA) / GOLPES_POR_LARANJA))
 
     for laranja in populacao.laranjas:
-        assert populacao.contas[laranja.conta].pessoa == TipoDePessoa.FISICA
         assert laranja.conta not in populacao.pessoas
+        assert laranja.conta not in populacao.todos_os_comercios
         assert PEQUENA.inicio <= laranja.ativa_de < PEQUENA.fim
         assert 2 <= (laranja.ativa_ate - laranja.ativa_de).days <= 20
         assert laranja.ativa_em(laranja.ativa_de)
         assert not laranja.ativa_em(laranja.ativa_ate)
+
+
+def test_uma_laranja_em_cinco_e_empresa_de_fachada(grande: Populacao) -> None:
+    empresas = [laranja for laranja in grande.laranjas if grande.contas[laranja.conta].pessoa is TipoDePessoa.JURIDICA]
+
+    assert len(empresas) == round(len(grande.laranjas) / 5)
+    assert all(grande.contas[laranja.conta].chave in {TipoDeChave.CNPJ, TipoDeChave.ALEATORIA} for laranja in empresas)
 
 
 def test_a_laranja_nasce_mais_nos_bancos_digitais(grande: Populacao) -> None:

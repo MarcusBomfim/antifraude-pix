@@ -22,6 +22,19 @@ def _legitimos(simulacao: Simulacao) -> pl.DataFrame:
     return simulacao.transacoes.join(simulacao.verdade.fraudes, left_on="id", right_on="transacao", how="anti")
 
 
+def _conhecidos() -> pl.DataFrame:
+    """Os contatos de cada cliente da simulação média: `cliente`, `recebedor`."""
+    return pl.DataFrame(
+        [(cliente.id, contato) for cliente in gerar_populacao(MEDIA).clientes for contato in cliente.contatos],
+        schema={"cliente": pl.Int32, "recebedor": pl.Int32},
+        orient="row",
+    )
+
+
+def _depois_do_primeiro_mes(legitimos: pl.DataFrame) -> pl.DataFrame:
+    return legitimos.filter(pl.col("momento").dt.date() >= date(2025, 8, 1))
+
+
 def test_o_movimento_do_dia_segue_o_calendario() -> None:
     dias = DiasDaSimulacao.de(Configuracao(inicio=date(2025, 11, 17), dias=21))
 
@@ -73,7 +86,7 @@ def test_o_cliente_legitimo_tambem_paga_pessoas_que_nunca_pagou_e_de_noite(simul
     )
 
     # Depois do primeiro mês, quando o hábito já se formou, ainda há Pix para pessoas que o cliente nunca pagou.
-    pessoas = legitimos.filter((pl.col("momento").dt.date() >= date(2025, 8, 1)) & (pl.col("recebedor_pessoa") == "PF"))
+    pessoas = _depois_do_primeiro_mes(legitimos).filter(pl.col("recebedor_pessoa") == "PF")
 
     assert pessoas["primeira_vez"].sum() / pessoas.height > 0.15
     assert legitimos.filter((pl.col("hora") >= 22) | (pl.col("hora") < 5)).height / legitimos.height > 0.03
@@ -81,19 +94,42 @@ def test_o_cliente_legitimo_tambem_paga_pessoas_que_nunca_pagou_e_de_noite(simul
 
 def test_o_cliente_legitimo_tambem_faz_pix_grande_para_quem_nao_conhece(simulacao: Simulacao) -> None:
     # O carro usado, a reforma: R$ 3.000 ou mais, para quem não é contato nem o locador.
-    populacao = gerar_populacao(MEDIA)
-    conhecidos = pl.DataFrame(
-        [(cliente.id, contato) for cliente in populacao.clientes for contato in cliente.contatos],
-        schema={"cliente": pl.Int32, "recebedor": pl.Int32},
-        orient="row",
-    )
     grandes = (
         _legitimos(simulacao)
         .filter(pl.col("valor") >= 300_000)
-        .join(conhecidos, on=["cliente", "recebedor"], how="anti")
+        .join(_conhecidos(), on=["cliente", "recebedor"], how="anti")
     )
 
     assert grandes.height > 100
+
+
+def test_o_cliente_legitimo_tambem_paga_o_autonomo_que_nunca_pagou_como_no_falso_parente(simulacao: Simulacao) -> None:
+    # A diarista, o eletricista: uma pessoa nova, R$ 150 ou mais em valor redondo — o que o falso parente pede.
+    depois = _depois_do_primeiro_mes(_legitimos(simulacao)).with_columns(
+        (pl.int_range(pl.len()).over("cliente", "recebedor") == 0).alias("primeira_vez")
+    )
+    redondos_a_quem_nunca_pagou = depois.filter(
+        pl.col("primeira_vez")
+        & (pl.col("recebedor_pessoa") == "PF")
+        & (pl.col("valor") >= 15_000)
+        & (pl.col("valor") % 1_000 == 0)
+    )
+    de_dia = redondos_a_quem_nunca_pagou.filter(pl.col("momento").dt.hour().is_between(9, 17))
+
+    # Sem o autônomo, seriam 2,5% dos Pix; com ele a qualquer hora, 3,9%. E o de dia seria pouco mais da metade.
+    assert de_dia.height / depois.height > 0.045
+    assert de_dia.height / redondos_a_quem_nunca_pagou.height > 0.65
+
+
+def test_o_cliente_legitimo_tambem_ajuda_a_familia_com_valor_alto_e_redondo(simulacao: Simulacao) -> None:
+    # O aluguel do filho, o remédio da mãe: R$ 500 ou mais, redondo, para um contato.
+    depois = _depois_do_primeiro_mes(_legitimos(simulacao))
+    ajudas = depois.join(_conhecidos(), on=["cliente", "recebedor"], how="semi").filter(
+        (pl.col("valor") >= 50_000) & (pl.col("valor") % 1_000 == 0)
+    )
+
+    # O aluguel que o cliente paga ao locador conhecido também entra aqui: sem a ajuda da família, seriam 1,8%.
+    assert ajudas.height / depois.height > 0.023
 
 
 def test_quem_leva_parte_do_saldo_nao_leva_menos_de_50_reais(simulacao: Simulacao) -> None:

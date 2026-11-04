@@ -225,7 +225,8 @@ def _redondo(centavos: float) -> int:
 def _falso_parente(gerador: np.random.Generator, ataque: Ataque, inicio: int) -> tuple[Passo, ...]:
     # Um, dois ou três Pix: depois do primeiro, "deu um problema, manda mais um pouco".
     quantos = int(gerador.choice([1, 2, 3], p=[0.6, 0.3, 0.1]))
-    valor = _redondo(_log_uniforme(gerador, 40_000, 300_000))
+    # De R$ 150 — "pra pagar uma conta que venceu hoje" — a R$ 3.000.
+    valor = _redondo(_log_uniforme(gerador, 15_000, 300_000))
     instante, resultado = inicio, []
 
     for _ in range(quantos):

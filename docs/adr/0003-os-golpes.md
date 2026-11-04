@@ -40,3 +40,17 @@ Um simulador que só tivesse o golpe fácil, de aparelho estranho e de madrugada
 - **O falso parente é difícil, como é de verdade.** O aparelho é o de sempre, a hora é comum e o recebedor é novo, mas o recebedor novo é comum também. O que sobra para o modelo é o valor fora do hábito, a pressa e a laranja que recebe de muitos.
 - **Cada golpe deixa um rastro diferente**, e por isso a medida de cada modelo vem separada por golpe, e não só no total.
 - **Os pesos são suposições de ordem de grandeza**, escritas no código com o porquê. Mudar a mistura dos golpes é mudar um dicionário, e os testes dizem o que cada golpe promete.
+
+## Revisão, na Parte 2: o simulador estava fácil demais
+
+Na Parte 2, medi o quanto cada variável, sozinha, separa cada golpe do Pix legítimo, pela área sob a curva ROC. A primeira versão do simulador estava fácil demais:
+- só o valor do Pix tinha força 0,98 no falso parente, numa escala em que 0,5 é não separar nada e 1 é separar tudo;
+- "o recebedor é uma empresa" separava os quatro golpes, porque toda laranja era pessoa física.
+
+Um modelo que acerta tudo num simulador fácil não prova nada. O simulador mudou em quatro pontos, para ficar como o mundo é:
+- **o autônomo**: um Pix comum em vinte paga a diarista, o eletricista, o frete. É uma pessoa nova, de dia, por volta de R$ 250, três em quatro vezes em valor redondo. Do lado do banco, é o falso parente;
+- **a ajuda da família**: um Pix comum em quarenta vai para um contato, de R$ 200 a R$ 2.000, quase sempre redondo;
+- **a laranja de fachada**: uma laranja em cada cinco é uma empresa, o MEI aberto para receber golpe, com CNPJ ou chave aleatória;
+- **o pedido pequeno**: o falso parente começa em R$ 150, "é só pra pagar uma conta que venceu hoje", e não mais em R$ 400.
+
+Com isso, um Pix comum em sete vai para uma pessoa que o cliente nunca pagou. A força do valor sozinho no falso parente caiu para 0,92, e a de "o recebedor é uma empresa" caiu de 0,81 para 0,71. Os testes da rotina e dos golpes conferem cada um dos quatro pontos.
