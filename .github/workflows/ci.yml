@@ -1,0 +1,50 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# Um push novo no mesmo ramo cancela a execução anterior: o resultado de um
+# commit já superado não interessa a ninguém.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  verificacao:
+    name: Formatação, lint, tipos e testes
+    runs-on: ubuntu-latest
+
+    steps:
+      # Actions fixadas pelo SHA do commit, e não pela tag: a tag pode ser
+      # movida por quem controla a action; o SHA não. O comentário diz a
+      # versão, para quem for atualizar.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      # O uv instala o Python da .python-version e as dependências do
+      # uv.lock, exatamente as mesmas da máquina de quem desenvolve. A versão
+      # do uv é a que gravou o uv.lock.
+      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        with:
+          version: '0.13.7'
+          enable-cache: true
+
+      - name: Instalar o ambiente
+        run: uv sync --locked
+
+      - name: Conferir a formatação
+        run: uv run ruff format --check .
+
+      - name: Lint
+        run: uv run ruff check .
+
+      - name: Conferir os tipos
+        run: uv run mypy
+
+      - name: Testes
+        run: uv run pytest

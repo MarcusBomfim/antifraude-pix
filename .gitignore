@@ -1,0 +1,22 @@
+# O ambiente e os caches do Python, do uv e das ferramentas.
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.hypothesis/
+.coverage
+htmlcov/
+dist/
+build/
+*.egg-info/
+
+# Os dados que o simulador gera: saem da semente, e não do repositório. Só na
+# raiz: o pacote src/antifraude_pix/dados é código, e vai para o Git.
+/dados/
+/dados-*/
+
+# O editor.
+.vscode/
+.idea/

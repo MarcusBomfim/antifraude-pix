@@ -1,0 +1,9 @@
+# Fim de linha LF no repositório e na cópia de trabalho, em qualquer
+# sistema. Sem isto, o Git no Windows converte para CRLF, o CI no Linux vê
+# LF, e a verificação de formatação acusa diferença onde não há nenhuma.
+* text=auto eol=lf
+
+*.png binary
+*.jpg binary
+*.pdf binary
+*.parquet binary

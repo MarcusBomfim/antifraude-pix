@@ -1,0 +1,73 @@
+[project]
+name = "antifraude-pix"
+version = "0.1.0"
+description = "Detecção de fraude em Pix: um simulador de transações com os golpes de verdade, e os modelos que aprendem com ele."
+requires-python = ">=3.13,<3.14"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Marcus Bomfim" }]
+# As versões ficam fixadas, como nos outros projetos: a mesma semente tem de
+# dar os mesmos dados hoje e daqui a um ano, e uma versão nova de biblioteca
+# entra quando alguém decide, e não quando ela sai.
+dependencies = [
+  "matplotlib==3.11.2",
+  "numpy==2.5.4",
+  "polars==1.44.2",
+]
+
+[project.scripts]
+antifraude-pix = "antifraude_pix.cli:principal"
+
+[dependency-groups]
+dev = [
+  "hypothesis==6.170.5",
+  "mypy==2.4.0",
+  "pytest==9.1.1",
+  "ruff==0.17.1",
+]
+
+[build-system]
+requires = ["uv_build>=0.13.4,<0.14"]
+build-backend = "uv_build"
+
+[tool.uv]
+required-version = ">=0.13.4,<0.14"
+
+[tool.ruff]
+line-length = 120
+target-version = "py313"
+
+[tool.ruff.lint]
+# Além dos erros de sempre: imports em ordem, Python moderno, os enganos
+# comuns (bugbear), simplificações, datas sem fuso, o que o pytest pede, os
+# números mágicos e os nomes. Aviso que ninguém corrige vira ruído.
+select = ["E", "W", "F", "I", "UP", "B", "SIM", "RUF", "DTZ", "PT", "PL", "N", "C4", "PIE", "RET", "TC", "PTH", "NPY"]
+ignore = [
+  # Os parâmetros do simulador são muitos de propósito: cada um é uma
+  # suposição sobre o mundo, nomeada e documentada.
+  "PLR0913",
+  # Os números do simulador — R$ 1.000 do limite noturno, 80 dias do MED —
+  # ficam na configuração, com nome; o que sobra nas comparações e nos
+  # testes é mais claro escrito do que apelidado.
+  "PLR2004",
+]
+
+[tool.ruff.format]
+quote-style = "double"
+
+[tool.mypy]
+strict = true
+python_version = "3.13"
+mypy_path = "src"
+files = ["src", "tests"]
+warn_unreachable = true
+
+[[tool.mypy.overrides]]
+module = ["matplotlib", "matplotlib.*"]
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = ["--strict-markers", "--strict-config", "-ra"]
+xfail_strict = true
+filterwarnings = ["error"]
