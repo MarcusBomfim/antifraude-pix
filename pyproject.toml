@@ -10,9 +10,11 @@ authors = [{ name = "Marcus Bomfim" }]
 # dar os mesmos dados hoje e daqui a um ano, e uma versão nova de biblioteca
 # entra quando alguém decide, e não quando ela sai.
 dependencies = [
+  "lightgbm==4.7.0",
   "matplotlib==3.11.2",
   "numpy==2.5.4",
   "polars==1.44.2",
+  "scikit-learn==1.9.1",
 ]
 
 [project.scripts]
@@ -64,6 +66,12 @@ warn_unreachable = true
 
 [[tool.mypy.overrides]]
 module = ["matplotlib", "matplotlib.*"]
+ignore_missing_imports = true
+
+# O scikit-learn não publica os tipos; o que vem dele é Any, e o código o
+# converte em tipos do NumPy logo na saída.
+[[tool.mypy.overrides]]
+module = ["sklearn", "sklearn.*"]
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]
