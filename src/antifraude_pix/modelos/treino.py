@@ -24,7 +24,8 @@ import polars as pl
 from sklearn.linear_model import LogisticRegression
 
 from antifraude_pix.modelos import regras
-from antifraude_pix.modelos.preparo import CATEGORICAS, PreparoDaLogistica, matriz_das_arvores
+from antifraude_pix.modelos.preparo import ENTRADA, PreparoDaLogistica, categoricas, matriz_das_arvores
+from antifraude_pix.variaveis.catalogo import Variavel
 
 SEMENTE = 2026
 
@@ -83,9 +84,12 @@ class Logistica:
 @dataclass(frozen=True, slots=True)
 class Arvores:
     modelo: lgb.LGBMClassifier = field(repr=False)
+    entrada: tuple[Variavel, ...] = ENTRADA
 
     def pontuar(self, variaveis: pl.DataFrame) -> npt.NDArray[np.float64]:
-        return np.asarray(self.modelo.predict(matriz_das_arvores(variaveis), raw_score=True), dtype=np.float64)
+        matriz = matriz_das_arvores(variaveis, self.entrada)
+
+        return np.asarray(self.modelo.predict(matriz, raw_score=True), dtype=np.float64)
 
 
 @dataclass(frozen=True, slots=True)
@@ -112,21 +116,21 @@ class Calibrado:
         return chance
 
 
-def treinar_regras(treino: pl.DataFrame, gerador: np.random.Generator) -> Regras:
-    del treino, gerador
+def treinar_regras(treino: pl.DataFrame, gerador: np.random.Generator, entrada: tuple[Variavel, ...]) -> Regras:
+    del treino, gerador, entrada
     return Regras()
 
 
-def treinar_logistica(treino: pl.DataFrame, gerador: np.random.Generator) -> Logistica:
+def treinar_logistica(treino: pl.DataFrame, gerador: np.random.Generator, entrada: tuple[Variavel, ...]) -> Logistica:
     del gerador
-    preparo = PreparoDaLogistica.ajustado(treino)
+    preparo = PreparoDaLogistica.ajustado(treino, entrada)
     modelo = LogisticRegression(**LOGISTICA)
     modelo.fit(preparo.matriz(treino), treino["rotulo"].to_numpy())
 
     return Logistica(preparo, modelo)
 
 
-def treinar_arvores(treino: pl.DataFrame, gerador: np.random.Generator) -> Arvores:
+def treinar_arvores(treino: pl.DataFrame, gerador: np.random.Generator, entrada: tuple[Variavel, ...]) -> Arvores:
     rotulo = treino["rotulo"].to_numpy()
     amostra = rotulo | (gerador.random(rotulo.size) < 1 / UM_LEGITIMO_EM)
     peso = np.where(rotulo, 1.0, float(UM_LEGITIMO_EM))[amostra]
@@ -139,13 +143,16 @@ def treinar_arvores(treino: pl.DataFrame, gerador: np.random.Generator) -> Arvor
         verbose=-1,
     )
     modelo.fit(
-        matriz_das_arvores(treino)[amostra], rotulo[amostra], sample_weight=peso, categorical_feature=list(CATEGORICAS)
+        matriz_das_arvores(treino, entrada)[amostra],
+        rotulo[amostra],
+        sample_weight=peso,
+        categorical_feature=list(categoricas(entrada)),
     )
 
-    return Arvores(modelo)
+    return Arvores(modelo, entrada)
 
 
-MODELOS: dict[str, Callable[[pl.DataFrame, np.random.Generator], Pontuador]] = {
+MODELOS: dict[str, Callable[[pl.DataFrame, np.random.Generator, tuple[Variavel, ...]], Pontuador]] = {
     "regras": treinar_regras,
     "logistica": treinar_logistica,
     "lightgbm": treinar_arvores,
@@ -178,9 +185,14 @@ def calibrar(nome: str, pontuador: Pontuador, calibracao: pl.DataFrame) -> Calib
     return Calibrado(nome, pontuador, float(platt.coef_[0, 0]), float(platt.intercept_[0]))
 
 
-def treinar(nome: str, janela: pl.DataFrame, corte: date, semente: int = SEMENTE) -> Calibrado:
-    """O modelo treinado na janela, com a probabilidade calibrada nos Pix maduros que ele não viu."""
+def treinar(
+    nome: str, janela: pl.DataFrame, corte: date, semente: int = SEMENTE, entrada: tuple[Variavel, ...] = ENTRADA
+) -> Calibrado:
+    """O modelo treinado na janela, com a probabilidade calibrada nos Pix maduros que ele não viu.
+
+    A entrada são as variáveis que o modelo recebe: todas, menos a idade. Mudá-la é para medir, e não para decidir.
+    """
     gerador = np.random.default_rng(semente)
     ajuste, calibracao = separar(janela, corte, gerador)
 
-    return calibrar(nome, MODELOS[nome](ajuste, gerador), calibracao)
+    return calibrar(nome, MODELOS[nome](ajuste, gerador, entrada), calibracao)

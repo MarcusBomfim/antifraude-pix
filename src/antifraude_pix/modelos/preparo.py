@@ -7,6 +7,11 @@ A logística pede tudo em número e na mesma escala:
 - tudo padronizado pela média e pelo desvio do treino, e só do treino.
 
 As árvores pedem pouco: o número como está, o vazio como vazio, a categoria pelo código.
+
+Nenhum dos dois recebe a idade do cliente (ADR-0011). O golpe mira os mais
+velhos, e o modelo que via a idade aprendeu a desconfiar deles: bloqueava o
+Pix honesto de quem tem 65 anos ou mais muito mais que o dos outros. A decisão
+olha o Pix, o hábito e o recebedor, e não quem a pessoa é.
 """
 
 from dataclasses import dataclass
@@ -15,54 +20,60 @@ import numpy as np
 import numpy.typing as npt
 import polars as pl
 
-from antifraude_pix.variaveis.catalogo import CATALOGO, Tipo
+from antifraude_pix.variaveis.catalogo import CATALOGO, Tipo, Variavel
 
 CASAS = {"hora": 24, "dia_da_semana": 7}
 """Os números que viram casas na logística: a madrugada não é a hora três vezes maior que a uma."""
 
-CATEGORICAS: tuple[int, ...] = tuple(
-    posicao for posicao, variavel in enumerate(CATALOGO) if variavel.tipo is Tipo.CATEGORIA
-)
-"""As posições das categorias na matriz das árvores, para o LightGBM tratá-las como categorias, e não como números."""
+PROTEGIDAS: tuple[str, ...] = ("idade",)
+"""As variáveis que o banco tem, mas que os modelos não recebem: a idade (ADR-0011)."""
+
+ENTRADA: tuple[Variavel, ...] = tuple(variavel for variavel in CATALOGO if variavel.nome not in PROTEGIDAS)
+"""As variáveis que os modelos recebem, na ordem do catálogo: todas, menos as protegidas."""
+
+
+def categoricas(entrada: tuple[Variavel, ...] = ENTRADA) -> tuple[int, ...]:
+    """As posições das categorias na matriz das árvores, para o LightGBM tratá-las como categorias, e não números."""
+    return tuple(posicao for posicao, variavel in enumerate(entrada) if variavel.tipo is Tipo.CATEGORIA)
 
 
 @dataclass(frozen=True, slots=True)
 class PreparoDaLogistica:
-    """As categorias, a média e o desvio de cada coluna, tirados do treino."""
+    """As variáveis que entram, e as categorias, a média e o desvio de cada coluna, tirados do treino."""
 
+    entrada: tuple[Variavel, ...]
     categorias: dict[str, tuple[str, ...]]
     media: npt.NDArray[np.float64]
     desvio: npt.NDArray[np.float64]
 
     @staticmethod
-    def ajustado(treino: pl.DataFrame) -> "PreparoDaLogistica":
+    def ajustado(treino: pl.DataFrame, entrada: tuple[Variavel, ...] = ENTRADA) -> "PreparoDaLogistica":
         """O preparo com as contas do treino: as categorias do tipo, a média e o desvio de cada coluna."""
         categorias = {
-            variavel.nome: _categorias(treino, variavel.nome)
-            for variavel in CATALOGO
-            if variavel.tipo is Tipo.CATEGORIA
+            variavel.nome: _categorias(treino, variavel.nome) for variavel in entrada if variavel.tipo is Tipo.CATEGORIA
         }
-        bruta = _bruta(treino, categorias)
+        bruta = _bruta(treino, entrada, categorias)
         desvio = bruta.std(axis=0)
         # A coluna que não varia no treino não ensina nada; fica como está, sem dividir por zero.
         desvio[desvio == 0] = 1.0
 
-        return PreparoDaLogistica(categorias, bruta.mean(axis=0), desvio)
+        return PreparoDaLogistica(entrada, categorias, bruta.mean(axis=0), desvio)
 
     @property
     def colunas(self) -> tuple[str, ...]:
         """O nome de cada coluna da matriz, na ordem."""
-        return tuple(expressao.meta.output_name() for expressao in _expressoes(self.categorias))
+        return tuple(expressao.meta.output_name() for expressao in _expressoes(self.entrada, self.categorias))
 
     def matriz(self, variaveis: pl.DataFrame) -> npt.NDArray[np.float64]:
         """As variáveis como a logística as recebe, padronizadas com a média e o desvio do treino."""
-        padronizada: npt.NDArray[np.float64] = (_bruta(variaveis, self.categorias) - self.media) / self.desvio
+        bruta = _bruta(variaveis, self.entrada, self.categorias)
+        padronizada: npt.NDArray[np.float64] = (bruta - self.media) / self.desvio
 
         return padronizada
 
 
-def matriz_das_arvores(variaveis: pl.DataFrame) -> npt.NDArray[np.float64]:
-    """As variáveis na ordem do catálogo, como as árvores as recebem.
+def matriz_das_arvores(variaveis: pl.DataFrame, entrada: tuple[Variavel, ...] = ENTRADA) -> npt.NDArray[np.float64]:
+    """As variáveis da entrada, na ordem do catálogo, como as árvores as recebem.
 
     O número fica como está, o sim ou não vira 1 ou 0, a categoria vira o código dela, e o vazio vira NaN.
     """
@@ -70,7 +81,7 @@ def matriz_das_arvores(variaveis: pl.DataFrame) -> npt.NDArray[np.float64]:
         (pl.col(variavel.nome).to_physical() if variavel.tipo is Tipo.CATEGORIA else pl.col(variavel.nome)).cast(
             pl.Float64
         )
-        for variavel in CATALOGO
+        for variavel in entrada
     ).to_numpy()
 
 
@@ -83,16 +94,18 @@ def _categorias(variaveis: pl.DataFrame, nome: str) -> tuple[str, ...]:
     return tuple(tipo.categories.to_list())
 
 
-def _bruta(variaveis: pl.DataFrame, categorias: dict[str, tuple[str, ...]]) -> npt.NDArray[np.float64]:
-    bruta: npt.NDArray[np.float64] = variaveis.select(_expressoes(categorias)).to_numpy().astype(np.float64)
+def _bruta(
+    variaveis: pl.DataFrame, entrada: tuple[Variavel, ...], categorias: dict[str, tuple[str, ...]]
+) -> npt.NDArray[np.float64]:
+    bruta: npt.NDArray[np.float64] = variaveis.select(_expressoes(entrada, categorias)).to_numpy().astype(np.float64)
 
     return bruta
 
 
-def _expressoes(categorias: dict[str, tuple[str, ...]]) -> list[pl.Expr]:
+def _expressoes(entrada: tuple[Variavel, ...], categorias: dict[str, tuple[str, ...]]) -> list[pl.Expr]:
     expressoes: list[pl.Expr] = []
 
-    for variavel in CATALOGO:
+    for variavel in entrada:
         nome, coluna = variavel.nome, pl.col(variavel.nome)
 
         if nome in CASAS:

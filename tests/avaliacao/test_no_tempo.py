@@ -11,6 +11,7 @@ from antifraude_pix.dados.banco import VisaoDoBanco
 from antifraude_pix.modelos.rotulo import Dobra
 from antifraude_pix.simulacao.simulador import Simulacao
 from antifraude_pix.variaveis.calculo import calcular
+from antifraude_pix.variaveis.catalogo import CATALOGO
 from tests.apoio import simulacao_media
 
 SETEMBRO = (Dobra(date(2025, 9, 1), date(2025, 9, 29)),)
@@ -102,3 +103,11 @@ def test_a_espera_pelo_rotulo_muda_o_que_o_modelo_aprende(variaveis: pl.DataFram
 def test_sem_dobra_nao_ha_avaliacao(variaveis: pl.DataFrame) -> None:
     with pytest.raises(ValueError, match="ao menos uma dobra"):
         avaliar(simulacao_media(), variaveis, ())
+
+
+def test_para_medir_a_avaliacao_treina_com_a_idade(variaveis: pl.DataFrame, pontuacoes: pl.DataFrame) -> None:
+    com_a_idade = avaliar(simulacao_media(), variaveis, SETEMBRO, modelos=("lightgbm",), entrada=CATALOGO)
+    sem_a_idade = pontuacoes.filter(pl.col("modelo") == "lightgbm")
+
+    assert com_a_idade["id"].equals(sem_a_idade["id"])
+    assert not np.allclose(com_a_idade["probabilidade"].to_numpy(), sem_a_idade["probabilidade"].to_numpy())

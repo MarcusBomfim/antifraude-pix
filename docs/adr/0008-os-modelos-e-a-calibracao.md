@@ -49,3 +49,24 @@ Um modelo de fraude só vale se for melhor que o que o banco já faz, e o que o 
 - **No meio, a probabilidade bate com o que acontece, e nas pontas o modelo é tímido.** Na faixa de 1% a 3%, o LightGBM previu 1,6% e foi golpe 2,0%; na de 10% a 30%, previu 17% e foi golpe 29%. Na Parte 4, a decisão acontece no meio, onde ela bate.
 - **As regras ficam mal calibradas**: com seis regras, a soma tem poucos valores, e a reta de Platt não tem o que ajustar.
 - **Os modelos são refeitos a cada corte**, e o treino de um mês leva uns 20 segundos nos dados padrão. Os experimentos rastreados e o modelo registrado vêm na Parte 5.
+
+## Revisão, na Parte 4: a idade saiu da entrada
+
+Na Parte 4, medi os erros de cada faixa de idade, e o modelo que via a idade bloqueava o Pix honesto de quem tem 65 anos ou mais 19 vezes mais que o de quem tem de 18 a 34 (ADR-0011). A idade saiu da entrada dos três modelos, que agora recebem 32 variáveis. Os parâmetros ficaram os mesmos.
+
+Os números desta ADR, da ADR-0007 e da ADR-0009 são da Parte 3, com a idade. Sem ela, de outubro a dezembro:
+
+| | Com a idade | Sem a idade |
+|---|--:|--:|
+| Precisão média do LightGBM | 0,934 | 0,932 |
+| Precisão média da regressão logística | 0,876 | 0,870 |
+| Golpes pegos no alerta pelo LightGBM | 97% | 97% |
+| Golpes previstos pelo LightGBM, contra 948 | 942 | 929 |
+| Golpes previstos pela logística | 883 | 860 |
+| Precisão média do LightGBM no falso parente | 0,810 | 0,799 |
+| Na venda falsa, com o rótulo do dia | 0,787 | 0,778 |
+| Na venda falsa, com a verdade | 0,864 | 0,862 |
+| O LightGBM com a verdade | 0,949 | 0,948 |
+| O LightGBM esperando 28 dias pelo rótulo | 0,929 | 0,928 |
+
+A calibração continua batendo no meio e tímida nas pontas. Na faixa de 1% a 3%, o LightGBM previu 1,6% e foi golpe 1,6%. Na de 10% a 30%, previu 17% e foi golpe 34%.

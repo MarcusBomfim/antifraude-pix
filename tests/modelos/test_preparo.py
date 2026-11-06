@@ -5,7 +5,7 @@ import polars as pl
 import pytest
 
 from antifraude_pix.dados.banco import VisaoDoBanco
-from antifraude_pix.modelos.preparo import CATEGORICAS, PreparoDaLogistica, matriz_das_arvores
+from antifraude_pix.modelos.preparo import ENTRADA, PROTEGIDAS, PreparoDaLogistica, categoricas, matriz_das_arvores
 from antifraude_pix.modelos.rotulo import janela_de_treino
 from antifraude_pix.variaveis.calculo import calcular
 from antifraude_pix.variaveis.catalogo import CATALOGO, NOMES, Tipo
@@ -25,8 +25,8 @@ def preparo(janela: pl.DataFrame) -> PreparoDaLogistica:
 
 def test_a_logistica_recebe_cada_numero_com_o_vazio_ao_lado_e_a_hora_em_casas(preparo: PreparoDaLogistica) -> None:
     colunas = preparo.colunas
-    numeros = [v.nome for v in CATALOGO if v.tipo is Tipo.NUMERO and v.nome not in {"hora", "dia_da_semana"}]
-    sim_ou_nao = [v.nome for v in CATALOGO if v.tipo is Tipo.SIM_OU_NAO]
+    numeros = [v.nome for v in ENTRADA if v.tipo is Tipo.NUMERO and v.nome not in {"hora", "dia_da_semana"}]
+    sim_ou_nao = [v.nome for v in ENTRADA if v.tipo is Tipo.SIM_OU_NAO]
 
     assert len(colunas) == 2 * len(numeros) + len(sim_ou_nao) + 24 + 7 + (3 + 1) + (5 + 1)
     assert {"valor", "valor vazia", "hora=0", "hora=23", "dia_da_semana=6", "chave=cnpj", "chave vazia"} <= set(colunas)
@@ -83,14 +83,26 @@ def test_a_categoria_tem_de_ser_fechada(janela: pl.DataFrame) -> None:
         PreparoDaLogistica.ajustado(janela.with_columns(pl.col("chave").cast(pl.String)))
 
 
+def test_a_entrada_e_o_catalogo_sem_a_idade(preparo: PreparoDaLogistica) -> None:
+    nomes = [variavel.nome for variavel in ENTRADA]
+
+    assert PROTEGIDAS == ("idade",)
+    assert nomes == [nome for nome in NOMES if nome != "idade"]
+    assert not any(coluna.startswith("idade") for coluna in preparo.colunas)
+
+
 def test_as_arvores_recebem_o_numero_como_esta_e_o_vazio_como_vazio(janela: pl.DataFrame) -> None:
     matriz = matriz_das_arvores(janela)
-    valor, mediana, chave = NOMES.index("valor"), NOMES.index("mediana_de_90_dias"), NOMES.index("chave")
+    nomes = [variavel.nome for variavel in ENTRADA]
+    valor, mediana, chave = nomes.index("valor"), nomes.index("mediana_de_90_dias"), nomes.index("chave")
 
-    assert matriz.shape == (janela.height, len(NOMES))
+    assert matriz.shape == (janela.height, len(ENTRADA))
     assert np.array_equal(matriz[:, valor], janela["valor"].to_numpy())
     assert np.isnan(matriz[:, mediana]).sum() == janela["mediana_de_90_dias"].null_count()
     assert np.array_equal(
         matriz[:, chave], janela["chave"].to_physical().cast(pl.Float64).fill_null(np.nan).to_numpy(), equal_nan=True
     )
-    assert (NOMES.index("iniciacao"), NOMES.index("chave")) == CATEGORICAS
+    assert (nomes.index("iniciacao"), nomes.index("chave")) == categoricas()
+    # A idade vem depois delas no catálogo: com ela ou sem ela, as categorias ficam no mesmo lugar.
+    assert categoricas(CATALOGO) == (NOMES.index("iniciacao"), NOMES.index("chave"))
+    assert matriz_das_arvores(janela, CATALOGO).shape == (janela.height, len(CATALOGO))

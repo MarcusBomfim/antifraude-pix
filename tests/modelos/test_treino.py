@@ -8,7 +8,7 @@ from sklearn.metrics import average_precision_score
 
 from antifraude_pix.dados.banco import VisaoDoBanco
 from antifraude_pix.modelos import regras
-from antifraude_pix.modelos.preparo import CATEGORICAS, matriz_das_arvores
+from antifraude_pix.modelos.preparo import ENTRADA, categoricas, matriz_das_arvores
 from antifraude_pix.modelos.rotulo import Dobra, janela_de_teste, janela_de_treino
 from antifraude_pix.modelos.treino import (
     LIGHTGBM,
@@ -21,6 +21,7 @@ from antifraude_pix.modelos.treino import (
     treinar_arvores,
 )
 from antifraude_pix.variaveis.calculo import calcular
+from antifraude_pix.variaveis.catalogo import CATALOGO
 from tests.apoio import simulacao_media
 
 CORTE = date(2025, 9, 1)
@@ -135,14 +136,32 @@ def test_o_peso_devolve_aos_legitimos_a_proporcao_que_eles_tem(janela: pl.DataFr
         force_col_wise=True,
         verbose=-1,
     )
-    sem_peso.fit(matriz_das_arvores(ajuste)[amostra], rotulo[amostra], categorical_feature=list(CATEGORICAS))
-    com_peso = treinar_arvores(ajuste, np.random.default_rng(3)).modelo
+    sem_peso.fit(matriz_das_arvores(ajuste)[amostra], rotulo[amostra], categorical_feature=list(categoricas()))
+    com_peso = treinar_arvores(ajuste, np.random.default_rng(3), ENTRADA).modelo
 
     def tipica(modelo: lgb.LGBMClassifier) -> float:
         chance = np.asarray(modelo.predict_proba(matriz_das_arvores(ajuste)), dtype=np.float64)
         return float(np.median(chance[:, 1]))
 
     assert tipica(com_peso) < tipica(sem_peso) / 3
+
+
+def test_nenhum_modelo_olha_a_idade(setembro: pl.DataFrame, treinados: dict[str, Calibrado]) -> None:
+    # Todos os clientes com 90 anos, ou com 18: a pontuação de cada Pix não muda.
+    for modelo in treinados.values():
+        pontuacao = modelo.pontuar(setembro)
+
+        for idade in (18, 90):
+            outra = setembro.with_columns(pl.lit(idade, dtype=pl.Int16).alias("idade"))
+            assert np.array_equal(modelo.pontuar(outra), pontuacao)
+
+
+@pytest.mark.parametrize("nome", ["logistica", "lightgbm"])
+def test_para_medir_o_modelo_pode_receber_a_idade(nome: str, janela: pl.DataFrame, setembro: pl.DataFrame) -> None:
+    com_a_idade = treinar(nome, janela, CORTE, entrada=CATALOGO)
+    noventa = setembro.with_columns(pl.lit(90, dtype=pl.Int16).alias("idade"))
+
+    assert not np.array_equal(com_a_idade.pontuar(noventa), com_a_idade.pontuar(setembro))
 
 
 def test_a_probabilidade_tem_teto_e_piso_sem_estourar_a_conta() -> None:
