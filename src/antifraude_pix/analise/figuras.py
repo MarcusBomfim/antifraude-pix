@@ -5,8 +5,14 @@ e o Pix legítimo é sempre o cinza neutro. Cada série tem o nome escrito ao
 lado dela ou no título do quadro: a cor ajuda, mas nunca está sozinha. Na
 tabela da força das variáveis, o azul vai do claro ao escuro, e o número está
 escrito em cada casa.
+
+Nas figuras dos modelos, as regras de hoje ficam no cinza, como referência; a
+regressão logística é violeta, e o LightGBM, verde.
 """
 
+from collections.abc import Callable
+from datetime import datetime, timedelta
+from functools import cached_property
 from pathlib import Path
 from typing import Any
 
@@ -19,7 +25,12 @@ from matplotlib.patches import Rectangle
 from matplotlib.ticker import FuncFormatter, MultipleLocator
 
 from antifraude_pix.analise import retrato, separacao
+from antifraude_pix.avaliacao import metricas
+from antifraude_pix.avaliacao.no_tempo import Rotulo, avaliar
 from antifraude_pix.dados.banco import VisaoDoBanco
+from antifraude_pix.modelos.rotulo import Dobra, dobras, primeiro_corte
+from antifraude_pix.modelos.treino import MODELOS
+from antifraude_pix.modelos.treino import NOMES as NOMES_DOS_MODELOS
 from antifraude_pix.simulacao.golpes import GOLPES, NOMES, Golpe
 from antifraude_pix.simulacao.simulador import Simulacao
 from antifraude_pix.variaveis.calculo import calcular
@@ -42,6 +53,9 @@ CORES: dict[str, str] = {
     "comércio": "#6250d6",
     "conta laranja": "#e34948",
 }
+
+CORES_DOS_MODELOS: dict[str, str] = {"regras": MUDO, "logistica": "#6250d6", "lightgbm": "#008300"}
+MODELOS_EM_ORDEM: tuple[str, ...] = tuple(MODELOS)
 
 AZUIS = (
     "#cde2fb", "#b7d3f6", "#9ec5f4", "#86b6ef", "#6da7ec", "#5598e7", "#3987e5",
@@ -248,9 +262,9 @@ def recebedores(simulacao: Simulacao) -> Figure:
     return figura
 
 
-def forca_das_variaveis(simulacao: Simulacao) -> Figure:
+def forca_das_variaveis(simulacao: Simulacao, variaveis: pl.DataFrame) -> Figure:
     """A força de cada variável, sozinha, contra cada golpe: uma tabela de calor, com os grupos do catálogo."""
-    tabela = separacao.forcas(simulacao, calcular(VisaoDoBanco.da(simulacao)))
+    tabela = separacao.forcas(simulacao, variaveis)
     forca = {(variavel, golpe): valor for variavel, golpe, valor in tabela.iter_rows()}
     escala = LinearSegmentedColormap.from_list("azuis", AZUIS)
 
@@ -320,6 +334,215 @@ def forca_das_variaveis(simulacao: Simulacao) -> Figure:
     return figura
 
 
+def golpes_pegos(pontuacoes: pl.DataFrame) -> Figure:
+    """A parte dos golpes que cada modelo pega, para cada parte dos Pix que o banco segura, com o alerta marcado."""
+    curva = metricas.curva_do_alerta(pontuacoes)
+    alerta = metricas.ALERTA
+    no_alerta = {
+        linha["modelo"]: linha["recall_no_alerta"] for linha in metricas.resumo(pontuacoes).iter_rows(named=True)
+    }
+
+    with mpl.rc_context(_ESTILO):
+        figura = _figura(4.8)
+        quadro = figura.subplots()
+
+        for modelo in MODELOS:
+            dele = curva.filter(pl.col("modelo") == modelo)
+            # A curva começa na origem: sem segurar nenhum Pix, nenhum golpe.
+            x = [1e-5, *dele["parte_segurada"].to_list()]
+            y = [0.0, *dele["recall"].to_list()]
+            quadro.plot(x, y, color=CORES_DOS_MODELOS[modelo], linewidth=2, drawstyle="steps-post")
+            pegos = no_alerta[modelo]
+            quadro.plot(
+                [alerta],
+                [pegos],
+                "o",
+                color=CORES_DOS_MODELOS[modelo],
+                markersize=8,
+                markeredgecolor=SUPERFICIE,
+                markeredgewidth=2,
+                label=f"{NOMES_DOS_MODELOS[modelo]}: {_porcentagem(pegos)}",
+            )
+
+        quadro.axvline(alerta, color=EIXO, linewidth=1, zorder=0)
+        quadro.text(alerta * 0.92, 0.04, "o alerta de 0,5%", ha="right", color=TINTA_SECUNDARIA, fontsize=9)
+        quadro.set_xscale("log")
+        quadro.set_xlim(1e-4, 0.1)
+        quadro.set_ylim(0, 1.02)
+        quadro.set_xticks([1e-4, 1e-3, 1e-2, 0.1], ["0,01%", "0,1%", "1%", "10%"])
+        quadro.set_xlabel("A parte dos Pix segurados para confirmar, dos de mais cara de golpe para baixo")
+        quadro.yaxis.set_major_formatter(FuncFormatter(_porcentagem))
+        # A legenda traz o número do alerta, no canto que as curvas deixam vazio.
+        ordem = sorted(range(len(MODELOS)), key=lambda indice: -no_alerta[MODELOS_EM_ORDEM[indice]])
+        marcas, nomes = quadro.get_legend_handles_labels()
+        quadro.legend(
+            [marcas[indice] for indice in ordem],
+            [nomes[indice] for indice in ordem],
+            title="No alerta de 0,5%:",
+            title_fontsize=9,
+            alignment="left",
+            frameon=False,
+            loc="lower right",
+            fontsize=10,
+        )
+        _titulo(
+            figura,
+            "Os golpes que cada modelo pega",
+            "A parte dos golpes dos meses de teste que cada modelo pega, para cada parte dos Pix que o banco segura.",
+        )
+
+    return figura
+
+
+def golpes_por_modelo(pontuacoes: pl.DataFrame) -> Figure:
+    """A parte de cada golpe que cada modelo pega no alerta: um grupo de barras por golpe."""
+    tabela = metricas.por_golpe(pontuacoes)
+    largura = 0.26
+
+    with mpl.rc_context(_ESTILO):
+        figura = _figura(5.0)
+        quadro = figura.subplots()
+
+        for indice, modelo in enumerate(MODELOS):
+            dele = {golpe: recall for _, golpe, _, recall, _ in tabela.filter(pl.col("modelo") == modelo).iter_rows()}
+            posicoes = [posicao + (indice - 1) * (largura + 0.03) for posicao in range(len(GOLPES))]
+            alturas = [dele[golpe.value] for golpe in GOLPES]
+            quadro.barh(
+                posicoes, alturas, height=largura, color=CORES_DOS_MODELOS[modelo], label=NOMES_DOS_MODELOS[modelo]
+            )
+
+            for posicao, altura in zip(posicoes, alturas, strict=True):
+                quadro.text(altura + 0.01, posicao, _porcentagem(altura), va="center", fontsize=9, color=TINTA)
+
+        quadro.set_yticks(range(len(GOLPES)), [NOMES[golpe][0].upper() + NOMES[golpe][1:] for golpe in GOLPES])
+        quadro.invert_yaxis()
+        quadro.set_xlim(0, 1.1)
+        quadro.xaxis.set_major_formatter(FuncFormatter(_porcentagem))
+        quadro.set_xticks([0, 0.25, 0.5, 0.75, 1.0])
+        quadro.grid(axis="y", visible=False)
+        quadro.tick_params(axis="y", length=0)
+        quadro.spines["left"].set_visible(False)
+        quadro.legend(frameon=False, loc="lower left", bbox_to_anchor=(0, 1), ncols=3, fontsize=9)
+        _titulo(
+            figura,
+            "O que cada modelo pega de cada golpe",
+            "A parte dos golpes de cada tipo entre os 0,5% de Pix de cada mês com mais cara de golpe.",
+        )
+
+    return figura
+
+
+def calibracao(pontuacoes: pl.DataFrame) -> Figure:
+    """A probabilidade prevista contra a parte que foi golpe, por faixa, para os dois modelos que aprendem."""
+    faixas = (0.0, 1e-4, 3e-4, 1e-3, 3e-3, 1e-2, 3e-2, 0.1, 0.3, 1.0)
+    tabela = metricas.confiabilidade(pontuacoes, faixas).filter(pl.col("observada") > 0)
+
+    with mpl.rc_context(_ESTILO):
+        figura = _figura(5.4)
+        quadro = figura.subplots()
+        quadro.plot([1e-5, 1], [1e-5, 1], color=EIXO, linewidth=1, linestyle="--", zorder=0)
+        quadro.text(
+            0.25, 0.012, "a linha em que o previsto\né o que acontece", color=TINTA_SECUNDARIA, fontsize=9, ha="right"
+        )
+
+        for modelo in ("logistica", "lightgbm"):
+            dele = tabela.filter(pl.col("modelo") == modelo)
+            quadro.plot(
+                dele["prevista"],
+                dele["observada"],
+                "o-",
+                color=CORES_DOS_MODELOS[modelo],
+                linewidth=2,
+                markersize=8,
+                markeredgecolor=SUPERFICIE,
+                markeredgewidth=2,
+                label=NOMES_DOS_MODELOS[modelo],
+            )
+
+        quadro.set_xscale("log")
+        quadro.set_yscale("log")
+        quadro.set_xlim(1e-5, 1)
+        quadro.set_ylim(1e-5, 1)
+        marcas, nomes = [1e-5, 1e-4, 1e-3, 1e-2, 0.1, 1.0], ["0,001%", "0,01%", "0,1%", "1%", "10%", "100%"]
+        quadro.set_xticks(marcas, nomes)
+        quadro.set_yticks(marcas, nomes)
+        quadro.set_xlabel("A probabilidade prevista, na média da faixa")
+        quadro.set_ylabel("A parte que foi golpe")
+        quadro.legend(frameon=False, loc="upper left", fontsize=9)
+        _titulo(
+            figura,
+            "A probabilidade, conferida com a verdade",
+            "Em cada faixa de probabilidade prevista, a parte dos Pix que foi golpe. No meio, onde o banco decide, "
+            "as duas batem; nas pontas, o modelo é tímido.",
+        )
+
+    return figura
+
+
+def rotulo_atrasado(do_dia: pl.DataFrame, com_a_verdade: pl.DataFrame) -> Figure:
+    """A precisão média do LightGBM em cada golpe, treinado com o rótulo do dia e com a verdade."""
+    lightgbm = pl.col("modelo") == "lightgbm"
+    do_dia_por_golpe = {
+        linha["golpe"]: linha["precisao_media"]
+        for linha in metricas.por_golpe(do_dia.filter(lightgbm)).iter_rows(named=True)
+    }
+    verdade_por_golpe = {
+        linha["golpe"]: linha["precisao_media"]
+        for linha in metricas.por_golpe(com_a_verdade.filter(lightgbm)).iter_rows(named=True)
+    }
+    cor = CORES_DOS_MODELOS["lightgbm"]
+
+    with mpl.rc_context(_ESTILO):
+        figura = _figura(4.2)
+        quadro = figura.subplots()
+
+        for posicao, golpe in enumerate(GOLPES):
+            dia, verdade = do_dia_por_golpe[golpe.value], verdade_por_golpe[golpe.value]
+            quadro.plot([dia, verdade], [posicao, posicao], color=EIXO, linewidth=2, zorder=1)
+            quadro.plot(
+                [verdade], [posicao], "o", color=SUPERFICIE, markeredgecolor=cor, markersize=9, markeredgewidth=2
+            )
+            quadro.plot([dia], [posicao], "o", color=cor, markersize=9, markeredgecolor=SUPERFICIE, markeredgewidth=2)
+            esquerda, direita = sorted((dia, verdade))
+            quadro.text(esquerda - 0.008, posicao, _decimal(esquerda), ha="right", va="center", fontsize=9)
+            quadro.text(direita + 0.008, posicao, _decimal(direita), ha="left", va="center", fontsize=9)
+
+        quadro.plot([], [], "o", color=cor, markersize=9, label="com o rótulo do dia, o que o banco tem")
+        quadro.plot(
+            [],
+            [],
+            "o",
+            color=SUPERFICIE,
+            markeredgecolor=cor,
+            markersize=9,
+            markeredgewidth=2,
+            label="com a verdade, que nenhum banco tem",
+        )
+        quadro.set_yticks(range(len(GOLPES)), [NOMES[golpe][0].upper() + NOMES[golpe][1:] for golpe in GOLPES])
+        quadro.invert_yaxis()
+        quadro.set_xlim(0.7, 1.03)
+        quadro.set_xticks([0.7, 0.8, 0.9, 1.0])
+        quadro.xaxis.set_major_formatter(FuncFormatter(lambda valor, _: f"{valor:.1f}".replace(".", ",")))
+        quadro.set_ylim(len(GOLPES) - 0.4, -1.1)
+        quadro.grid(axis="y", visible=False)
+        quadro.tick_params(axis="y", length=0)
+        quadro.spines["left"].set_visible(False)
+        quadro.set_xlabel("A precisão média do LightGBM no golpe, contra o Pix legítimo")
+        quadro.legend(frameon=False, loc="upper left", fontsize=9, ncols=2)
+        _titulo(
+            figura,
+            "O preço do rótulo atrasado",
+            "O golpe que demora a ser contestado é o que o banco aprende menos: a venda falsa.",
+        )
+
+    return figura
+
+
+def _decimal(valor: float) -> str:
+    """Três casas: a invasão de conta fica entre 0,995 e 0,996, e duas casas a mostrariam como 0,99 e 1,00."""
+    return f"{valor:.3f}".replace(".", ",")
+
+
 def _rotulo(nome: str) -> str:
     """O nome da variável como se lê: `pix_na_ultima_hora` vira "Pix na última hora"."""
     return " ".join(_COM_ACENTO.get(palavra, palavra) for palavra in nome.split("_"))
@@ -337,23 +560,60 @@ def _afastados(alturas: dict[str, float], distancia: float) -> dict[str, float]:
     return resultado
 
 
-FIGURAS = {
-    "horas": horas,
-    "valores": valores,
-    "contestacao": contestacao,
-    "recebedores": recebedores,
-    "separacao": forca_das_variaveis,
+class Insumos:
+    """O que as figuras pedem, calculado uma vez só, e só quando alguma figura pede: as variáveis e as avaliações."""
+
+    def __init__(self, simulacao: Simulacao, as_dobras: tuple[Dobra, ...] | None = None) -> None:
+        self.simulacao = simulacao
+        self._dobras = as_dobras
+
+    @cached_property
+    def variaveis(self) -> pl.DataFrame:
+        return calcular(VisaoDoBanco.da(self.simulacao))
+
+    @cached_property
+    def dobras(self) -> tuple[Dobra, ...]:
+        """As dobras pedidas, ou as do padrão: do primeiro mês de teste ao fim dos dados."""
+        if self._dobras is not None:
+            return self._dobras
+
+        visao = VisaoDoBanco.da(self.simulacao)
+        ultimo = visao.transacoes["momento"].max()
+        fim = ultimo.date() if isinstance(ultimo, datetime) else self.simulacao.config.fim - timedelta(days=1)
+
+        return dobras(primeiro_corte(visao), fim)
+
+    @cached_property
+    def pontuacoes(self) -> pl.DataFrame:
+        return avaliar(self.simulacao, self.variaveis, self.dobras)
+
+    @cached_property
+    def com_a_verdade(self) -> pl.DataFrame:
+        return avaliar(self.simulacao, self.variaveis, self.dobras, modelos=("lightgbm",), rotulo=Rotulo.VERDADE)
+
+
+FIGURAS: dict[str, Callable[[Insumos], Figure]] = {
+    "horas": lambda insumos: horas(insumos.simulacao),
+    "valores": lambda insumos: valores(insumos.simulacao),
+    "contestacao": lambda insumos: contestacao(insumos.simulacao),
+    "recebedores": lambda insumos: recebedores(insumos.simulacao),
+    "separacao": lambda insumos: forca_das_variaveis(insumos.simulacao, insumos.variaveis),
+    "golpes_pegos": lambda insumos: golpes_pegos(insumos.pontuacoes),
+    "golpes_por_modelo": lambda insumos: golpes_por_modelo(insumos.pontuacoes),
+    "calibracao": lambda insumos: calibracao(insumos.pontuacoes),
+    "rotulo_atrasado": lambda insumos: rotulo_atrasado(insumos.pontuacoes, insumos.com_a_verdade),
 }
 
 
-def gerar(simulacao: Simulacao, pasta: Path) -> list[Path]:
-    """Desenha as figuras e as grava em PNG na pasta."""
+def gerar(simulacao: Simulacao, pasta: Path, as_dobras: tuple[Dobra, ...] | None = None) -> list[Path]:
+    """Desenha as figuras e as grava em PNG na pasta. As dobras da avaliação são as do padrão, se não vierem."""
     pasta.mkdir(parents=True, exist_ok=True)
+    insumos = Insumos(simulacao, as_dobras)
     gravadas = []
 
     for nome, desenhar in FIGURAS.items():
         destino = pasta / f"{nome}.png"
-        desenhar(simulacao).savefig(destino, dpi=150)
+        desenhar(insumos).savefig(destino, dpi=150)
         gravadas.append(destino)
 
     return gravadas

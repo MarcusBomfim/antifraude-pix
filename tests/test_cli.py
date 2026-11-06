@@ -1,3 +1,4 @@
+from datetime import date
 from pathlib import Path
 
 import polars as pl
@@ -75,3 +76,32 @@ def test_variaveis_da_pasta_que_nao_existe_falha_com_o_motivo(
 ) -> None:
     assert principal(["variaveis", str(tmp_path / "nenhuma")]) == 1
     assert "antifraude-pix variaveis: não consegui ler" in capsys.readouterr().err
+
+
+def test_avaliar_treina_mes_a_mes_e_mede_contra_a_verdade(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    # De 1º de julho a 2 de novembro: aquecimento, agosto de treino, setembro de validação, outubro e novembro de teste.
+    principal(["simular", "--clientes", "150", "--dias", "125", "--golpes-por-mil", "200", "--saida", str(tmp_path)])
+    capsys.readouterr()
+
+    assert principal(["avaliar", str(tmp_path)]) == 0
+    impresso = capsys.readouterr().out
+    pontuacoes = pl.read_parquet(tmp_path / "avaliacao.parquet")
+
+    assert impresso.startswith("Teste de 01/10/2025 a 02/11/2025, em 2 meses: ")
+    assert all(modelo in impresso for modelo in ("as regras de hoje", "a regressão logística", "o LightGBM"))
+    assert pontuacoes["modelo"].unique(maintain_order=True).to_list() == ["regras", "logistica", "lightgbm"]
+    assert pontuacoes["corte"].unique().sort().to_list() == [date(2025, 10, 1), date(2025, 11, 1)]
+
+
+def test_avaliar_dados_curtos_demais_falha_com_o_motivo(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    principal(["simular", "--clientes", "30", "--dias", "60", "--saida", str(tmp_path)])
+    capsys.readouterr()
+
+    assert principal(["avaliar", str(tmp_path)]) == 1
+    assert "não chegam a um mês de teste" in capsys.readouterr().err
+    assert not (tmp_path / "avaliacao.parquet").exists()
+
+
+def test_avaliar_a_pasta_que_nao_existe_falha_com_o_motivo(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    assert principal(["avaliar", str(tmp_path / "nenhuma")]) == 1
+    assert "antifraude-pix avaliar: não consegui ler" in capsys.readouterr().err

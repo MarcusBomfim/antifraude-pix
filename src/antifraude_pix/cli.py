@@ -1,14 +1,27 @@
-"""A linha de comando: `simular` gera os dados, `validar` os confere, e `variaveis` calcula as variáveis de cada Pix."""
+"""A linha de comando do projeto.
+
+- `simular` gera os dados;
+- `validar` os confere;
+- `variaveis` calcula as variáveis de cada Pix;
+- `avaliar` treina os modelos mês a mês com o rótulo do dia, e os mede contra a verdade.
+"""
 
 import argparse
 import sys
 import time
 from collections.abc import Sequence
-from datetime import date
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
+import polars as pl
+
+from antifraude_pix.avaliacao.metricas import ALERTA, resumo
+from antifraude_pix.avaliacao.no_tempo import avaliar
+from antifraude_pix.dados.banco import VisaoDoBanco
 from antifraude_pix.dados.gravacao import gravar, ler, ler_o_banco
 from antifraude_pix.dados.validacao import problemas
+from antifraude_pix.modelos.rotulo import Dobra, dobras, primeiro_corte
+from antifraude_pix.modelos.treino import NOMES as NOMES_DOS_MODELOS
 from antifraude_pix.simulacao.configuracao import Configuracao
 from antifraude_pix.simulacao.golpes import NOMES, Golpe
 from antifraude_pix.simulacao.simulador import Simulacao, simular
@@ -28,6 +41,9 @@ def principal(argumentos: Sequence[str] | None = None) -> int:
 
     if pedido.comando == "variaveis":
         return _variaveis(pedido.pasta, pedido.saida)
+
+    if pedido.comando == "avaliar":
+        return _avaliar(pedido.pasta, pedido.saida)
 
     return _validar(pedido.pasta)
 
@@ -70,6 +86,16 @@ def _leitor() -> argparse.ArgumentParser:
     )
     variaveis.add_argument(
         "--saida", type=Path, help="o arquivo das variáveis (padrão: variaveis.parquet, na pasta dos dados)"
+    )
+
+    avaliar_ = comandos.add_parser(
+        "avaliar", help="treina os modelos mês a mês com o rótulo do dia, e os mede contra a verdade do simulador"
+    )
+    avaliar_.add_argument(
+        "pasta", type=Path, nargs="?", default=Path("dados"), help="a pasta dos dados (padrão: dados)"
+    )
+    avaliar_.add_argument(
+        "--saida", type=Path, help="o arquivo das pontuações (padrão: avaliacao.parquet, na pasta dos dados)"
     )
 
     return leitor
@@ -143,6 +169,79 @@ def _variaveis(pasta: Path, saida: Path | None) -> int:
     return 0
 
 
+def _avaliar(pasta: Path, saida: Path | None) -> int:
+    """Treina em cada corte com o que o banco sabia, pontua o mês do corte, e mede contra a verdade (ADR-0009)."""
+    try:
+        simulacao = ler(pasta)
+    except (OSError, ValueError, KeyError) as erro:
+        print(f"antifraude-pix avaliar: não consegui ler {pasta}: {erro}", file=sys.stderr)
+        return 1
+
+    comeco = time.perf_counter()
+    visao = VisaoDoBanco.da(simulacao)
+    ultimo = visao.transacoes["momento"].max()
+    as_dobras = dobras(primeiro_corte(visao), ultimo.date()) if isinstance(ultimo, datetime) else ()
+
+    if not as_dobras:
+        print(
+            f"antifraude-pix avaliar: os dados de {pasta} não chegam a um mês de teste. Antes dele, são precisos "
+            "o aquecimento, um mês de treino e um mês de validação.",
+            file=sys.stderr,
+        )
+        return 1
+
+    pontuacoes = avaliar(simulacao, calcular(visao), as_dobras)
+    destino = saida or pasta / "avaliacao.parquet"
+    destino.parent.mkdir(parents=True, exist_ok=True)
+    pontuacoes.write_parquet(destino, compression="zstd")
+
+    print(_quadro(pontuacoes, as_dobras))
+    print(f"Pontuações gravadas em {destino}, em {_numero(round(time.perf_counter() - comeco))} s.")
+
+    return 0
+
+
+def _quadro(pontuacoes: pl.DataFrame, as_dobras: tuple[Dobra, ...]) -> str:
+    """O resumo da avaliação em texto: uma linha por modelo."""
+    um_modelo = pontuacoes.filter(pl.col("modelo") == pontuacoes["modelo"][0])
+    golpes = int(um_modelo["golpe"].is_not_null().sum())
+    ultimo_dia = as_dobras[-1].fim - timedelta(days=1)
+    meses = "mês" if len(as_dobras) == 1 else "meses"
+    cabecalho = "".join(
+        f"{titulo:>{largura}}"
+        for titulo, largura in (
+            ("", 24),
+            ("precisão média", 16),
+            ("golpes pegos", 14),
+            ("dinheiro salvo", 16),
+            ("honestos por golpe", 20),
+            ("golpes previstos", 18),
+        )
+    )
+    linhas = [
+        f"Teste de {as_dobras[0].corte:%d/%m/%Y} a {ultimo_dia:%d/%m/%Y}, em {len(as_dobras)} {meses}: "
+        f"{_numero(um_modelo.height)} Pix, {_numero(golpes)} de golpe.",
+        "O treino usa só o rótulo do dia; a medida, a verdade do simulador.",
+        f"Segurando, em cada mês, os {_porcentagem(ALERTA, casas=1)} de Pix com mais cara de golpe:",
+        "",
+        cabecalho,
+    ]
+
+    for linha in resumo(pontuacoes).iter_rows(named=True):
+        honestos = linha["legitimos_por_golpe_pego"]
+        colunas = (
+            (NOMES_DOS_MODELOS[linha["modelo"]], 24, "<"),
+            (_decimal(linha["precisao_media"]), 16, ">"),
+            (_porcentagem(linha["recall_no_alerta"], casas=0), 14, ">"),
+            (_porcentagem(linha["recall_em_reais"], casas=0), 16, ">"),
+            ("—" if honestos is None else _decimal(honestos, casas=1), 20, ">"),
+            (_numero(round(linha["golpes_previstos"])), 18, ">"),
+        )
+        linhas.append("".join(f"{texto:{lado}{largura}}" for texto, largura, lado in colunas))
+
+    return "\n".join(linhas)
+
+
 def _mostrar_problemas(encontrados: list[str]) -> None:
     print("Os dados têm problemas:", file=sys.stderr)
 
@@ -174,8 +273,12 @@ def _numero(valor: int) -> str:
     return f"{valor:,}".replace(",", ".")
 
 
-def _porcentagem(fracao: float) -> str:
-    return f"{fracao:.2%}".replace(".", ",")
+def _porcentagem(fracao: float, casas: int = 2) -> str:
+    return f"{fracao:.{casas}%}".replace(".", ",")
+
+
+def _decimal(valor: float, casas: int = 2) -> str:
+    return f"{valor:.{casas}f}".replace(".", ",")
 
 
 if __name__ == "__main__":

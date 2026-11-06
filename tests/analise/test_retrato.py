@@ -1,9 +1,11 @@
+from datetime import date
 from pathlib import Path
 
 import polars as pl
 import pytest
 
 from antifraude_pix.analise import figuras, retrato
+from antifraude_pix.modelos.rotulo import Dobra
 from antifraude_pix.simulacao.golpes import GOLPES
 from antifraude_pix.simulacao.simulador import Simulacao
 
@@ -68,7 +70,8 @@ def test_os_rotulos_proximos_se_afastam_sem_mudar_de_ordem() -> None:
 
 
 def test_as_figuras_sao_gravadas_em_png(simulacao: Simulacao, tmp_path: Path) -> None:
-    gravadas = figuras.gerar(simulacao, tmp_path)
+    # A simulação média termina em setembro: o teste dos modelos é setembro, sem o mês de validação.
+    gravadas = figuras.gerar(simulacao, tmp_path, (Dobra(date(2025, 9, 1), date(2025, 9, 29)),))
 
     assert [figura.name for figura in gravadas] == [
         "horas.png",
@@ -76,5 +79,9 @@ def test_as_figuras_sao_gravadas_em_png(simulacao: Simulacao, tmp_path: Path) ->
         "contestacao.png",
         "recebedores.png",
         "separacao.png",
+        "golpes_pegos.png",
+        "golpes_por_modelo.png",
+        "calibracao.png",
+        "rotulo_atrasado.png",
     ]
     assert all(figura.read_bytes().startswith(b"\x89PNG") for figura in gravadas)

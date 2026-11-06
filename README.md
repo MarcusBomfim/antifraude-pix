@@ -3,9 +3,9 @@
 [![CI](https://github.com/MarcusBomfim/antifraude-pix/actions/workflows/ci.yml/badge.svg)](https://github.com/MarcusBomfim/antifraude-pix/actions/workflows/ci.yml)
 [![Licença: MIT](https://img.shields.io/badge/licen%C3%A7a-MIT-blue.svg)](LICENSE)
 
-Detecção de fraude em Pix, do lado do banco de quem paga: o banco tem alguns milissegundos para decidir se cada Pix sai, segura para confirmar ou é bloqueado. O projeto começa por um simulador de transações com os golpes que acontecem no Brasil — o falso parente, a falsa central, a invasão de conta e a venda falsa — e com o rótulo que o banco tem de verdade: a contestação, que chega dias depois e nem sempre chega. Sobre esses dados vêm as variáveis calculadas sem olhar o futuro e, nas próximas partes, os modelos, a decisão pelo custo, a explicação em português e o serviço que pontua em tempo real.
+Detecção de fraude em Pix, do lado do banco de quem paga: o banco tem alguns milissegundos para decidir se cada Pix sai, segura para confirmar ou é bloqueado. O projeto começa por um simulador de transações com os golpes que acontecem no Brasil — o falso parente, a falsa central, a invasão de conta e a venda falsa — e com o rótulo que o banco tem de verdade: a contestação, que chega dias depois e nem sempre chega. Sobre esses dados vêm as variáveis calculadas sem olhar o futuro e os modelos validados no tempo, com o rótulo que o banco tinha no dia. Nas próximas partes, vêm a decisão pelo custo, a explicação em português e o serviço que pontua em tempo real.
 
-Python 3.13 · uv · NumPy · Polars · Parquet · matplotlib · pytest · hypothesis · ruff · mypy · GitHub Actions
+Python 3.13 · uv · NumPy · Polars · Parquet · scikit-learn · LightGBM · matplotlib · pytest · hypothesis · ruff · mypy · GitHub Actions
 
 > Projeto independente, de estudo e portfólio. Não tem ligação com nenhum banco nem com o Banco Central. Os dados são de um simulador: não há nenhum dado real de cliente, nem nenhuma transação de verdade.
 
@@ -94,6 +94,41 @@ Cada golpe deixa um rastro diferente:
 
 Nenhuma variável basta sozinha, porque o golpe é raro. Para pegar 80% dos golpes só pelo valor, o banco seguraria um Pix legítimo em cada seis: 244 Pix de clientes honestos para cada golpe pego. Juntar as variáveis num modelo e decidir pelo custo são as Partes 3 e 4.
 
+## Os modelos
+
+Três modelos aprendem, mês a mês, com o que o banco sabia na véspera ([ADR-0007](docs/adr/0007-a-validacao-no-tempo-e-o-rotulo-do-dia.md), [ADR-0008](docs/adr/0008-os-modelos-e-a-calibracao.md)):
+- **as regras de hoje**: seis regras escritas à mão, cada uma com os seus pontos. Entre elas, o aparelho novo, o recebedor já contestado e o Pix fora do hábito para quem o cliente nunca pagou;
+- **a regressão logística**, com os números em logaritmo e o vazio indicado;
+- **o LightGBM**, com árvores rasas e muitas.
+
+O treino de cada mês usa o rótulo do dia: o Pix é golpe se foi contestado até ali, e mais nada. A probabilidade é calibrada em Pix antigos, que o modelo não viu. A medida é contra a verdade do simulador, nos três meses de teste, de outubro a dezembro, com 1,16 milhão de Pix e 948 golpes ([ADR-0009](docs/adr/0009-as-metricas-para-classe-rara.md)):
+
+| | Precisão média | Golpes pegos | Dinheiro salvo | Honestos por golpe | Golpes previstos |
+|---|--:|--:|--:|--:|--:|
+| as regras de hoje | 0,42 | 53% | 76% | 1,7 | 1.361 |
+| a regressão logística | 0,88 | 93% | 97% | 5,6 | 883 |
+| o LightGBM | 0,93 | 97% | 99% | 5,3 | 942 |
+
+Os golpes pegos, o dinheiro salvo e os honestos são do alerta: os 0,5% de Pix de cada mês com mais cara de golpe, que o banco segura para confirmar com o cliente.
+
+![Os golpes que cada modelo pega: segurando 0,5% dos Pix, o LightGBM pega 97% dos golpes, a regressão logística 93% e as regras de hoje 53%; com 10% dos Pix segurados, as regras ainda deixam passar um terço](docs/imagens/golpes_pegos.png)
+
+O LightGBM pega 97% dos golpes segurando 0,5% dos Pix. As regras pegam pouco mais da metade, e segurar mais não as ajuda muito: com 10% dos Pix segurados, ainda deixam passar um terço dos golpes. Elas também seguram menos que os 0,5%, porque os Pix empatados nos mesmos pontos não cabem todos no alerta; por isso os honestos por golpe delas parecem melhores.
+
+![O que cada modelo pega de cada golpe: no falso parente, o LightGBM pega 91%, a logística 81% e as regras 40%; na invasão de conta, os dois modelos pegam 100%](docs/imagens/golpes_por_modelo.png)
+
+O falso parente é o golpe mais difícil, porque sai do aparelho da vítima, de dia, para uma pessoa, num valor que o autônomo também cobra. A invasão de conta é a mais fácil: o aparelho da quadrilha a denuncia.
+
+![O preço do rótulo atrasado: na venda falsa, o LightGBM tem 0,787 de precisão média com o rótulo do dia e teria 0,864 com a verdade; nos outros golpes, a diferença é de menos de dois centésimos](docs/imagens/rotulo_atrasado.png)
+
+No total, o rótulo atrasado custa pouco: 0,934 de precisão média com o rótulo do dia, contra 0,949 com a verdade, que nenhum banco tem. Quase todo o custo está na venda falsa, que é contestada em semanas, quando é. Esperar o rótulo amadurecer não ajuda: esperando 28 dias, o LightGBM cai para 0,929, porque perde os golpes mais recentes.
+
+![A probabilidade, conferida com a verdade: entre 0,3% e 3% de probabilidade prevista, a parte que foi golpe acompanha a diagonal; acima de 10%, foi golpe mais vezes do que o modelo previu](docs/imagens/calibracao.png)
+
+A probabilidade fecha a conta: o LightGBM previu 942 golpes, e houve 948. No meio, onde a Parte 4 vai decidir, a probabilidade prevista bate com o que acontece; nas pontas, o modelo é tímido.
+
+Os números são de um simulador, e um banco de verdade fica abaixo deles. O que vale levar daqui é a comparação entre os modelos, a diferença entre os golpes e o método de medir.
+
 ## Roteiro
 
 O projeto é construído em partes, cada uma entregue funcionando, testada e documentada.
@@ -102,7 +137,7 @@ O projeto é construído em partes, cada uma entregue funcionando, testada e doc
 |--:|---|---|
 | 1 | O simulador do Pix: a população, a rotina de cada cliente, os quatro golpes, a contestação atrasada, o contrato dos dados e o retrato | ✅ |
 | 2 | As variáveis sem olhar o futuro: o valor fora do hábito, a pressa, o recebedor novo, a conta que recebe de muitos desconhecidos, o aparelho novo — com testes que provam que não há vazamento | ✅ |
-| 3 | Os modelos: as regras de hoje como ponto de partida, a regressão logística e o LightGBM; a validação no tempo, com o rótulo que o banco tinha no dia; as métricas para classe rara; a probabilidade calibrada | |
+| 3 | Os modelos: as regras de hoje como ponto de partida, a regressão logística e o LightGBM; a validação no tempo, com o rótulo que o banco tinha no dia; as métricas para classe rara; a probabilidade calibrada | ✅ |
 | 4 | A decisão e o porquê: aprovar, segurar para confirmar ou bloquear, pelo custo; a explicação em português de cada decisão; o modelo que não erra mais com os mais velhos | |
 | 5 | Os experimentos rastreados no MLflow, o modelo registrado com a sua ficha, e o mesmo processo numa base pública real, de cartões | |
 | 6 | A pontuação em tempo real: a API em FastAPI, a latência medida, e o teste de que a API e o treino calculam as mesmas variáveis | |
@@ -133,6 +168,21 @@ O projeto é construído em partes, cada uma entregue funcionando, testada e doc
 - **O cálculo em lote**, com o Polars: as variáveis dos 2,4 milhões de Pix da simulação padrão em cerca de seis segundos.
 - **A força de cada variável**, sozinha, contra cada golpe: a área sob a curva ROC, com o vazio contado como o menor valor.
 
+**Parte 3 — os modelos**
+
+- **A validação no tempo**, uma dobra por mês: o treino com tudo o que veio antes do corte, e o teste no mês do corte. Setembro ficou para escolher os parâmetros, e o teste vai de outubro a dezembro.
+- **O rótulo do dia**: o Pix é golpe se foi contestado antes do corte. O treino não espera o rótulo amadurecer, porque esperar custa mais que o rótulo atrasado.
+- **Três modelos**:
+  - as regras de hoje, com os seus pontos;
+  - a regressão logística, com o preparo ajustado só no treino;
+  - o LightGBM, com todos os golpes e um legítimo em cada dez, com peso dez.
+- **A probabilidade calibrada** pelo método de Platt, em Pix maduros que o modelo não viu.
+- **As métricas para classe rara**:
+  - a precisão média;
+  - no alerta de 0,5% dos Pix de cada mês, os golpes pegos, o dinheiro salvo e os honestos segurados por golpe;
+  - cada golpe separado;
+  - a calibração contra a verdade.
+
 ## Decisões
 
 As decisões que mudam o desenho do projeto estão registradas em [`docs/adr`](docs/adr):
@@ -143,6 +193,9 @@ As decisões que mudam o desenho do projeto estão registradas em [`docs/adr`](d
 - [ADR-0004](docs/adr/0004-o-rotulo-atrasado-e-o-contrato-dos-dados.md) — o rótulo atrasado e sujo, o contrato dos dados, e a verdade em outra pasta.
 - [ADR-0005](docs/adr/0005-a-visao-do-banco-e-o-corte-no-tempo.md) — a visão do banco, e o corte no tempo: o que o banco sabia em cada instante.
 - [ADR-0006](docs/adr/0006-as-variaveis-no-ponto-do-tempo.md) — as variáveis no ponto do tempo: cada uma com o que o banco sabia antes do Pix.
+- [ADR-0007](docs/adr/0007-a-validacao-no-tempo-e-o-rotulo-do-dia.md) — a validação no tempo, e o rótulo do dia: o modelo aprende com o que o banco sabia.
+- [ADR-0008](docs/adr/0008-os-modelos-e-a-calibracao.md) — os modelos: as regras de hoje, a regressão logística e o LightGBM, com a probabilidade calibrada.
+- [ADR-0009](docs/adr/0009-as-metricas-para-classe-rara.md) — as métricas para classe rara: o topo da fila, o alerta do mês, cada golpe e a calibração.
 
 ## Testes
 
@@ -182,6 +235,23 @@ As decisões que mudam o desenho do projeto estão registradas em [`docs/adr`](d
   - o primeiro Pix de cada ataque vai para um recebedor novo;
   - a venda falsa termina em 90 centavos.
 - **A força**: a variável que separa tudo vale 1, nos dois sentidos; a que não separa nada, 0,5; o empate vale meio; o vazio é o menor valor.
+- **O rótulo do dia e as dobras**:
+  - uma dobra por mês, e a última até o fim dos dados;
+  - o rótulo é o contestado antes do corte, e não sabe de todos os golpes;
+  - a janela de treino é a mesma com o banco inteiro e com o banco do dia do corte.
+- **O preparo**:
+  - a logística é padronizada pelas contas do treino, e só dele;
+  - o vazio vira zero com o indicador aceso;
+  - a hora vai em casas;
+  - as árvores recebem o vazio como vazio.
+- **As regras**, cada uma com os seus pontos e a sua borda.
+- **O treino**:
+  - o mesmo treino com a mesma semente dá a mesma probabilidade;
+  - a calibração é sorteada entre os Pix maduros que o treino não vê, e nela a soma das probabilidades é o número de golpes;
+  - os modelos que aprendem ganham das regras.
+- **A avaliação sem vazamento, de ponta a ponta**: cortar a simulação no meio do mês de teste não muda a pontuação de nenhum Pix anterior ao corte.
+- **As métricas, conferidas em exemplos à mão**: o alerta de cada mês, o empate na fronteira, a precisão média, a área ROC, o dinheiro salvo, cada golpe, a calibração e a curva do alerta.
+- **O código dos modelos**: o pacote não importa o simulador, a gravação, as análises nem a avaliação, e não toca na verdade.
 - **A linha de comando e as figuras**: o que sai, o que é recusado, e as figuras gravadas.
 
 ## Como rodar
@@ -222,7 +292,13 @@ As variáveis de cada Pix, calculadas só com o que o banco sabia antes dele, gr
 uv run antifraude-pix variaveis
 ```
 
-As figuras deste README:
+Os três modelos, treinados mês a mês com o rótulo do dia e medidos contra a verdade, em cerca de um minuto, com as pontuações gravadas em `dados/avaliacao.parquet`:
+
+```bash
+uv run antifraude-pix avaliar
+```
+
+As figuras deste README, em uns dois minutos:
 
 ```bash
 uv run python -m antifraude_pix.analise
@@ -268,14 +344,22 @@ src/antifraude_pix/
   variaveis/
     catalogo.py         as 33 variáveis: o nome, o grupo, o tipo e a frase de cada uma
     calculo.py          o cálculo em lote, cada variável só com o passado
+  modelos/
+    rotulo.py           o rótulo do dia, as janelas de treino e de teste, e as dobras no tempo
+    preparo.py          as variáveis como matriz, do jeito de cada modelo
+    regras.py           as regras de hoje, com os seus pontos
+    treino.py           os três modelos e a calibração de Platt
+  avaliacao/
+    no_tempo.py         o treino em cada corte e o teste no mês do corte, contra a verdade
+    metricas.py         as métricas para classe rara
   analise/
     retrato.py          as contas do retrato de cada golpe
     separacao.py        a força de cada variável, sozinha, contra cada golpe
     figuras.py          as figuras do README
-  cli.py                antifraude-pix simular, validar e variaveis
-tests/                  o simulador, os dados, as variáveis e as análises
+  cli.py                antifraude-pix simular, validar, variaveis e avaliar
+tests/                  o simulador, os dados, as variáveis, os modelos, a avaliação e as análises
 docs/adr/               decisões de arquitetura
-docs/imagens/           as figuras do retrato e da força das variáveis
+docs/imagens/           as figuras do retrato, da força das variáveis e dos modelos
 ```
 
 ## Licença
