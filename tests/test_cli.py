@@ -105,3 +105,51 @@ def test_avaliar_dados_curtos_demais_falha_com_o_motivo(tmp_path: Path, capsys: 
 def test_avaliar_a_pasta_que_nao_existe_falha_com_o_motivo(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
     assert principal(["avaliar", str(tmp_path / "nenhuma")]) == 1
     assert "antifraude-pix avaliar: não consegui ler" in capsys.readouterr().err
+
+
+def test_decidir_decide_explica_e_mede_o_custo_e_os_erros_por_idade(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    principal(["simular", "--clientes", "150", "--dias", "125", "--golpes-por-mil", "200", "--saida", str(tmp_path)])
+    capsys.readouterr()
+
+    assert principal(["decidir", str(tmp_path)]) == 0
+    impresso = capsys.readouterr().out
+    decisoes = pl.read_parquet(tmp_path / "decisoes.parquet")
+    nao_aprovados = decisoes.filter(pl.col("acao") != "aprovar")
+
+    assert impresso.startswith("Decisões de 01/10/2025 a 02/11/2025, em 2 meses: ")
+    assert all(
+        politica in impresso
+        for politica in ("aprovar tudo", "bloquear de 50% para cima", "segurar o alerta de 0,5%", "decidir pelo custo")
+    )
+    assert all(faixa in impresso for faixa in ("18 a 34", "35 a 54", "55 a 64", "65 ou mais"))
+    assert decisoes.columns == [
+        "id",
+        "corte",
+        "modelo",
+        "pontuacao",
+        "probabilidade",
+        "valor",
+        "idade",
+        "acao",
+        "explicacao",
+        "golpe",
+    ]
+    assert decisoes["corte"].unique().sort().to_list() == [date(2025, 10, 1), date(2025, 11, 1)]
+    assert nao_aprovados.height > 0
+    assert nao_aprovados["explicacao"].str.contains(" de chance de golpe: ").all()
+
+
+def test_decidir_dados_curtos_demais_falha_com_o_motivo(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    principal(["simular", "--clientes", "30", "--dias", "60", "--saida", str(tmp_path)])
+    capsys.readouterr()
+
+    assert principal(["decidir", str(tmp_path)]) == 1
+    assert "antifraude-pix decidir: os dados de" in capsys.readouterr().err
+    assert not (tmp_path / "decisoes.parquet").exists()
+
+
+def test_decidir_a_pasta_que_nao_existe_falha_com_o_motivo(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    assert principal(["decidir", str(tmp_path / "nenhuma")]) == 1
+    assert "antifraude-pix decidir: não consegui ler" in capsys.readouterr().err

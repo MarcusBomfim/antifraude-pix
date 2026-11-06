@@ -3,7 +3,7 @@
 [![CI](https://github.com/MarcusBomfim/antifraude-pix/actions/workflows/ci.yml/badge.svg)](https://github.com/MarcusBomfim/antifraude-pix/actions/workflows/ci.yml)
 [![Licença: MIT](https://img.shields.io/badge/licen%C3%A7a-MIT-blue.svg)](LICENSE)
 
-Detecção de fraude em Pix, do lado do banco de quem paga: o banco tem alguns milissegundos para decidir se cada Pix sai, segura para confirmar ou é bloqueado. O projeto começa por um simulador de transações com os golpes que acontecem no Brasil — o falso parente, a falsa central, a invasão de conta e a venda falsa — e com o rótulo que o banco tem de verdade: a contestação, que chega dias depois e nem sempre chega. Sobre esses dados vêm as variáveis calculadas sem olhar o futuro e os modelos validados no tempo, com o rótulo que o banco tinha no dia. Nas próximas partes, vêm a decisão pelo custo, a explicação em português e o serviço que pontua em tempo real.
+Detecção de fraude em Pix, do lado do banco de quem paga: o banco tem alguns milissegundos para decidir se cada Pix sai, segura para confirmar ou é bloqueado. O projeto começa por um simulador de transações com os golpes que acontecem no Brasil — o falso parente, a falsa central, a invasão de conta e a venda falsa — e com o rótulo que o banco tem de verdade: a contestação, que chega dias depois e nem sempre chega. Sobre esses dados vêm as variáveis calculadas sem olhar o futuro, os modelos validados no tempo com o rótulo que o banco tinha no dia, e a decisão de cada Pix pelo custo, explicada em português e medida para não errar mais com os mais velhos. Nas próximas partes, vêm os experimentos rastreados e o serviço que pontua em tempo real.
 
 Python 3.13 · uv · NumPy · Polars · Parquet · scikit-learn · LightGBM · matplotlib · pytest · hypothesis · ruff · mypy · GitHub Actions
 
@@ -101,13 +101,13 @@ Três modelos aprendem, mês a mês, com o que o banco sabia na véspera ([ADR-0
 - **a regressão logística**, com os números em logaritmo e o vazio indicado;
 - **o LightGBM**, com árvores rasas e muitas.
 
-O treino de cada mês usa o rótulo do dia: o Pix é golpe se foi contestado até ali, e mais nada. A probabilidade é calibrada em Pix antigos, que o modelo não viu. A medida é contra a verdade do simulador, nos três meses de teste, de outubro a dezembro, com 1,16 milhão de Pix e 948 golpes ([ADR-0009](docs/adr/0009-as-metricas-para-classe-rara.md)):
+Nenhum dos três recebe a idade do cliente: ela saiu do modelo na Parte 4 ([ADR-0011](docs/adr/0011-a-idade-fora-do-modelo.md)). O treino de cada mês usa o rótulo do dia: o Pix é golpe se foi contestado até ali, e mais nada. A probabilidade é calibrada em Pix antigos, que o modelo não viu. A medida é contra a verdade do simulador, nos três meses de teste, de outubro a dezembro, com 1,16 milhão de Pix e 948 golpes ([ADR-0009](docs/adr/0009-as-metricas-para-classe-rara.md)):
 
 | | Precisão média | Golpes pegos | Dinheiro salvo | Honestos por golpe | Golpes previstos |
 |---|--:|--:|--:|--:|--:|
 | as regras de hoje | 0,42 | 53% | 76% | 1,7 | 1.361 |
-| a regressão logística | 0,88 | 93% | 97% | 5,6 | 883 |
-| o LightGBM | 0,93 | 97% | 99% | 5,3 | 942 |
+| a regressão logística | 0,87 | 93% | 97% | 5,6 | 860 |
+| o LightGBM | 0,93 | 97% | 99% | 5,3 | 929 |
 
 Os golpes pegos, o dinheiro salvo e os honestos são do alerta: os 0,5% de Pix de cada mês com mais cara de golpe, que o banco segura para confirmar com o cliente.
 
@@ -115,19 +115,58 @@ Os golpes pegos, o dinheiro salvo e os honestos são do alerta: os 0,5% de Pix d
 
 O LightGBM pega 97% dos golpes segurando 0,5% dos Pix. As regras pegam pouco mais da metade, e segurar mais não as ajuda muito: com 10% dos Pix segurados, ainda deixam passar um terço dos golpes. Elas também seguram menos que os 0,5%, porque os Pix empatados nos mesmos pontos não cabem todos no alerta; por isso os honestos por golpe delas parecem melhores.
 
-![O que cada modelo pega de cada golpe: no falso parente, o LightGBM pega 91%, a logística 81% e as regras 40%; na invasão de conta, os dois modelos pegam 100%](docs/imagens/golpes_por_modelo.png)
+![O que cada modelo pega de cada golpe: no falso parente, o LightGBM pega 90%, a logística 80% e as regras 40%; na invasão de conta, os dois modelos pegam 100%](docs/imagens/golpes_por_modelo.png)
 
 O falso parente é o golpe mais difícil, porque sai do aparelho da vítima, de dia, para uma pessoa, num valor que o autônomo também cobra. A invasão de conta é a mais fácil: o aparelho da quadrilha a denuncia.
 
-![O preço do rótulo atrasado: na venda falsa, o LightGBM tem 0,787 de precisão média com o rótulo do dia e teria 0,864 com a verdade; nos outros golpes, a diferença é de menos de dois centésimos](docs/imagens/rotulo_atrasado.png)
+![O preço do rótulo atrasado: na venda falsa, o LightGBM tem 0,778 de precisão média com o rótulo do dia e teria 0,862 com a verdade; nos outros golpes, a diferença é de menos de dois centésimos](docs/imagens/rotulo_atrasado.png)
 
-No total, o rótulo atrasado custa pouco: 0,934 de precisão média com o rótulo do dia, contra 0,949 com a verdade, que nenhum banco tem. Quase todo o custo está na venda falsa, que é contestada em semanas, quando é. Esperar o rótulo amadurecer não ajuda: esperando 28 dias, o LightGBM cai para 0,929, porque perde os golpes mais recentes.
+No total, o rótulo atrasado custa pouco: 0,932 de precisão média com o rótulo do dia, contra 0,948 com a verdade, que nenhum banco tem. Quase todo o custo está na venda falsa, que é contestada em semanas, quando é. Esperar o rótulo amadurecer não ajuda: esperando 28 dias, o LightGBM cai para 0,928, porque perde os golpes mais recentes.
 
-![A probabilidade, conferida com a verdade: entre 0,3% e 3% de probabilidade prevista, a parte que foi golpe acompanha a diagonal; acima de 10%, foi golpe mais vezes do que o modelo previu](docs/imagens/calibracao.png)
+![A probabilidade, conferida com a verdade: entre 0,1% e 3% de probabilidade prevista, a parte que foi golpe acompanha a diagonal; acima de 3%, foi golpe mais vezes do que o modelo previu](docs/imagens/calibracao.png)
 
-A probabilidade fecha a conta: o LightGBM previu 942 golpes, e houve 948. No meio, onde a Parte 4 vai decidir, a probabilidade prevista bate com o que acontece; nas pontas, o modelo é tímido.
+A probabilidade fecha a conta: o LightGBM previu 929 golpes, e houve 948. No meio, onde a decisão acontece, a probabilidade prevista bate com o que acontece; nas pontas, o modelo é tímido.
 
 Os números são de um simulador, e um banco de verdade fica abaixo deles. O que vale levar daqui é a comparação entre os modelos, a diferença entre os golpes e o método de medir.
+
+## A decisão e o porquê
+
+A probabilidade vira decisão pelo custo de cada lado ([ADR-0010](docs/adr/0010-a-decisao-pelo-custo.md)). O banco tem três saídas para cada Pix: aprovar, segurar alguns minutos para confirmar com o cliente, ou bloquear. Cada erro tem um preço, e os preços são suposições escritas, de ordem de grandeza:
+- o golpe que passa custa o valor dele;
+- segurar um Pix para confirmar custa R$ 10;
+- bloquear o Pix de um cliente honesto custa R$ 150;
+- a confirmação para 70% dos golpes, porque a vítima convencida confirma.
+
+Cada Pix vai para a saída de menor custo esperado. Por isso o limiar depende do valor: o Pix de R$ 50 só é segurado com 29% de chance de golpe, e o de R$ 3.000, com 0,5%.
+
+![O mapa da decisão: no plano do valor e da chance de golpe, aprovar fica embaixo e à esquerda, segurar para confirmar é uma faixa no meio, e bloquear fica no alto e à direita; quase todos os golpes caem em segurar ou bloquear, e quase todos os Pix honestos, em aprovar](docs/imagens/mapa_da_decisao.png)
+
+Nos três meses de teste, com o LightGBM:
+
+| | Custo | Perdido em golpes | Golpes parados | Honestos segurados | Honestos bloqueados |
+|---|--:|--:|--:|--:|--:|
+| aprovar tudo | R$ 1.757 mil | R$ 1.757 mil | 0 | 0 | 0 |
+| segurar o alerta de 0,5% | R$ 597 mil | R$ 539 mil | 643 | 4.878 | 0 |
+| bloquear de 50% para cima | R$ 268 mil | R$ 268 mil | 766 | 0 | 4 |
+| **decidir pelo custo** | **R$ 101 mil** | **R$ 80 mil** | **842** | **1.645** | **25** |
+
+![O custo de cada jeito de decidir: aprovar tudo custa R$ 1,76 milhão; segurar o alerta de 0,5%, R$ 597 mil; bloquear de 50% para cima, R$ 268 mil; decidir pelo custo, R$ 101 mil](docs/imagens/custo_das_politicas.png)
+
+Decidir pelo custo custa um décimo do que custa o banco sem defesa, e mexe em pouco: segura 0,15% dos Pix e bloqueia 0,07%. Segurar não basta, porque a confirmação deixa passar 30% de cada golpe segurado: o golpe com muita cara de golpe tem de ser bloqueado. Os preços mudam o custo, e não a escolha: em 27 combinações de preços, decidir pelo custo foi sempre o mais barato.
+
+Cada Pix segurado ou bloqueado sai com as suas razões, em português ([ADR-0012](docs/adr/0012-a-explicacao-em-portugues.md)). A LGPD (art. 20) dá ao cliente o direito de pedir a revisão de uma decisão automatizada, e quem revisa precisa saber o que pesou. As razões saem dos valores de Shapley das árvores: o quanto cada variável empurrou a pontuação, numa conta em que a base mais as contribuições dá a própria pontuação. As três que mais empurraram para o golpe viram frases, com o valor de cada uma. Por exemplo:
+
+> Bloqueado, com 80% de chance de golpe: 2 Pix para este recebedor já tinham sido contestados como golpe; o recebedor não recebeu nenhum Pix de clientes do banco nas 24 horas anteriores; e é o primeiro Pix do cliente para este recebedor.
+
+> Segurado para confirmar com o cliente, com 0,8% de chance de golpe: o Pix é 89% da renda mensal do cliente; é o primeiro Pix do cliente para este recebedor; e o Pix é de R$ 7.100,00.
+
+O segundo era de um cliente honesto: um Pix grande, para alguém novo. É o erro que a confirmação existe para resolver.
+
+O golpe mira os mais velhos, e o modelo da Parte 3, que recebia a idade, aprendeu a desconfiar deles ([ADR-0011](docs/adr/0011-a-idade-fora-do-modelo.md)). Medindo os erros por faixa de idade, ele bloqueava o Pix honesto de quem tem 65 anos ou mais 19 vezes mais que o de quem tem de 18 a 34. A idade saiu do modelo:
+
+![Os erros com cada idade: com a idade e sem ela, os golpes pegos ficam parecidos em todas as faixas, de 91% a 95%; os honestos de 65 anos ou mais bloqueados a cada 10 mil Pix caem de 3,01 para 0,24, como nas outras faixas; os segurados caem de 42,8 para 27,3](docs/imagens/erros_por_idade.png)
+
+Sem a idade, o modelo pega os mesmos golpes contra os mais velhos (93%), e bloqueia o Pix honesto deles como o de qualquer idade. O custo subiu 0,9%. O honesto de 65 anos ou mais ainda é segurado quase três vezes mais, porque o golpe contra eles é quatro vezes mais comum, e o hábito deles se parece com o das vítimas. Cada Pix segurado de um idoso, por outro lado, é golpe mais vezes que o de um jovem.
 
 ## Roteiro
 
@@ -138,7 +177,7 @@ O projeto é construído em partes, cada uma entregue funcionando, testada e doc
 | 1 | O simulador do Pix: a população, a rotina de cada cliente, os quatro golpes, a contestação atrasada, o contrato dos dados e o retrato | ✅ |
 | 2 | As variáveis sem olhar o futuro: o valor fora do hábito, a pressa, o recebedor novo, a conta que recebe de muitos desconhecidos, o aparelho novo — com testes que provam que não há vazamento | ✅ |
 | 3 | Os modelos: as regras de hoje como ponto de partida, a regressão logística e o LightGBM; a validação no tempo, com o rótulo que o banco tinha no dia; as métricas para classe rara; a probabilidade calibrada | ✅ |
-| 4 | A decisão e o porquê: aprovar, segurar para confirmar ou bloquear, pelo custo; a explicação em português de cada decisão; o modelo que não erra mais com os mais velhos | |
+| 4 | A decisão e o porquê: aprovar, segurar para confirmar ou bloquear, pelo custo; a explicação em português de cada decisão; o modelo que não erra mais com os mais velhos | ✅ |
 | 5 | Os experimentos rastreados no MLflow, o modelo registrado com a sua ficha, e o mesmo processo numa base pública real, de cartões | |
 | 6 | A pontuação em tempo real: a API em FastAPI, a latência medida, e o teste de que a API e o treino calculam as mesmas variáveis | |
 | 7 | O monitoramento: os dados que mudam, o rótulo que chega depois, o golpe novo, e o retreino comparando o modelo atual com o candidato | |
@@ -183,6 +222,17 @@ O projeto é construído em partes, cada uma entregue funcionando, testada e doc
   - cada golpe separado;
   - a calibração contra a verdade.
 
+**Parte 4 — a decisão e o porquê**
+
+- **A decisão pelo custo**: aprovar, segurar para confirmar ou bloquear, a saída de menor custo esperado para a probabilidade e o valor de cada Pix. Os preços de cada erro são suposições escritas, num lugar só.
+- **O custo de fato, contra a verdade**: o custo de aprovar tudo, de segurar o alerta de 0,5%, de bloquear de 50% para cima e de decidir pelo custo, com os golpes parados e os honestos segurados e bloqueados.
+- **A idade fora do modelo.** Ela continua no cadastro, para medir, e os modelos recebem as outras 32 variáveis.
+- **Os erros por idade**: os golpes pegos e os honestos segurados e bloqueados em cada faixa, de 18 a 34 anos até 65 ou mais.
+- **A explicação em português** de cada Pix segurado ou bloqueado:
+  - as três variáveis que mais empurraram a pontuação para o golpe, cada uma numa frase com o valor dela;
+  - pelos valores de Shapley no LightGBM, pelos pesos na regressão logística e pelos pontos nas regras;
+  - a idade, que não entra no modelo, não tem frase.
+
 ## Decisões
 
 As decisões que mudam o desenho do projeto estão registradas em [`docs/adr`](docs/adr):
@@ -196,6 +246,9 @@ As decisões que mudam o desenho do projeto estão registradas em [`docs/adr`](d
 - [ADR-0007](docs/adr/0007-a-validacao-no-tempo-e-o-rotulo-do-dia.md) — a validação no tempo, e o rótulo do dia: o modelo aprende com o que o banco sabia.
 - [ADR-0008](docs/adr/0008-os-modelos-e-a-calibracao.md) — os modelos: as regras de hoje, a regressão logística e o LightGBM, com a probabilidade calibrada.
 - [ADR-0009](docs/adr/0009-as-metricas-para-classe-rara.md) — as métricas para classe rara: o topo da fila, o alerta do mês, cada golpe e a calibração.
+- [ADR-0010](docs/adr/0010-a-decisao-pelo-custo.md) — a decisão pelo custo: aprovar, segurar para confirmar ou bloquear.
+- [ADR-0011](docs/adr/0011-a-idade-fora-do-modelo.md) — a idade fora do modelo, e os erros por idade.
+- [ADR-0012](docs/adr/0012-a-explicacao-em-portugues.md) — a explicação em português de cada decisão.
 
 ## Testes
 
@@ -252,6 +305,20 @@ As decisões que mudam o desenho do projeto estão registradas em [`docs/adr`](d
 - **A avaliação sem vazamento, de ponta a ponta**: cortar a simulação no meio do mês de teste não muda a pontuação de nenhum Pix anterior ao corte.
 - **As métricas, conferidas em exemplos à mão**: o alerta de cada mês, o empate na fronteira, a precisão média, a área ROC, o dinheiro salvo, cada golpe, a calibração e a curva do alerta.
 - **O código dos modelos**: o pacote não importa o simulador, a gravação, as análises nem a avaliação, e não toca na verdade.
+- **A decisão pelo custo**:
+  - cada Pix vai para a saída de menor custo esperado, conferida em exemplos à mão e em valores sorteados pelo hypothesis;
+  - o limiar depende do valor, e o empate fica com a saída mais branda;
+  - mais chance de golpe, ou mais dinheiro em jogo, nunca deixa a saída mais branda;
+  - os preços sem sentido são recusados.
+- **O custo de fato de cada jeito de decidir**, num mês feito à mão: o golpe e o honesto em cada saída, o alerta com o empate e o limiar na borda.
+- **A idade fora do modelo**: mudar a idade de todos os clientes não muda a pontuação de nenhum Pix, em nenhum dos três modelos. Para medir, o modelo ainda pode recebê-la.
+- **Os erros por idade**: as bordas de cada faixa, os dois erros e os golpes previstos, conferidos à mão.
+- **A explicação**:
+  - nos três modelos, a base mais as contribuições é a pontuação, até a nona casa;
+  - as razões são as que mais empurraram para o golpe, sem repetir a frase;
+  - na invasão de conta, o aparelho quase sempre está entre elas;
+  - cada variável tem a sua frase para todo valor que aparece nos dados, e a idade não tem;
+  - o pacote da decisão não importa o simulador nem a avaliação.
 - **A linha de comando e as figuras**: o que sai, o que é recusado, e as figuras gravadas.
 
 ## Como rodar
@@ -298,7 +365,13 @@ Os três modelos, treinados mês a mês com o rótulo do dia e medidos contra a 
 uv run antifraude-pix avaliar
 ```
 
-As figuras deste README, em uns dois minutos:
+A decisão de cada Pix de teste pelo custo, com o LightGBM de cada mês, a explicação de cada decisão e os erros por idade, em menos de um minuto, gravados em `dados/decisoes.parquet`:
+
+```bash
+uv run antifraude-pix decidir
+```
+
+As figuras deste README, em uns quatro minutos:
 
 ```bash
 uv run python -m antifraude_pix.analise
@@ -346,20 +419,26 @@ src/antifraude_pix/
     calculo.py          o cálculo em lote, cada variável só com o passado
   modelos/
     rotulo.py           o rótulo do dia, as janelas de treino e de teste, e as dobras no tempo
-    preparo.py          as variáveis como matriz, do jeito de cada modelo
+    preparo.py          as variáveis como matriz, do jeito de cada modelo, e sem a idade
     regras.py           as regras de hoje, com os seus pontos
     treino.py           os três modelos e a calibração de Platt
   avaliacao/
     no_tempo.py         o treino em cada corte e o teste no mês do corte, contra a verdade
     metricas.py         as métricas para classe rara
+    decisoes.py         o custo de fato de cada jeito de decidir
+    justica.py          os erros em cada faixa de idade
+  decisao/
+    custo.py            aprovar, segurar ou bloquear: a saída de menor custo esperado
+    explicacao.py       as razões de cada decisão, pela conta do próprio modelo
+    frases.py           a frase de cada variável com o valor dela, em português
   analise/
     retrato.py          as contas do retrato de cada golpe
     separacao.py        a força de cada variável, sozinha, contra cada golpe
     figuras.py          as figuras do README
-  cli.py                antifraude-pix simular, validar, variaveis e avaliar
-tests/                  o simulador, os dados, as variáveis, os modelos, a avaliação e as análises
+  cli.py                antifraude-pix simular, validar, variaveis, avaliar e decidir
+tests/                  o simulador, os dados, as variáveis, os modelos, a avaliação, a decisão e as análises
 docs/adr/               decisões de arquitetura
-docs/imagens/           as figuras do retrato, da força das variáveis e dos modelos
+docs/imagens/           as figuras do retrato, da força das variáveis, dos modelos e da decisão
 ```
 
 ## Licença

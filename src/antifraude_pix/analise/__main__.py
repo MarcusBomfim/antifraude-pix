@@ -1,7 +1,8 @@
 """As figuras do README a partir dos dados gravados: `uv run python -m antifraude_pix.analise`.
 
-Com a simulação padrão, leva uns três minutos: as figuras dos modelos treinam
-os três modelos em cada mês de teste, e o LightGBM mais uma vez com a verdade.
+Com a simulação padrão, leva uns quatro minutos: as figuras dos modelos treinam
+os três modelos em cada mês de teste, e o LightGBM mais duas vezes: com a
+verdade, e com a idade que saiu do modelo.
 """
 
 import argparse
@@ -15,7 +16,7 @@ from antifraude_pix.dados.gravacao import ler
 def principal() -> int:
     leitor = argparse.ArgumentParser(
         prog="python -m antifraude_pix.analise",
-        description="Desenha o retrato dos dados, a força das variáveis e a avaliação dos modelos.",
+        description="Desenha o retrato dos dados, a força das variáveis, a avaliação dos modelos e a decisão.",
     )
     leitor.add_argument("--dados", type=Path, default=Path("dados"), help="a pasta dos dados (padrão: %(default)s)")
     leitor.add_argument("--saida", type=Path, default=Path("docs/imagens"), help="onde gravar (padrão: %(default)s)")

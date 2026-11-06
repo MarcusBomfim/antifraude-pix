@@ -8,6 +8,10 @@ escrito em cada casa.
 
 Nas figuras dos modelos, as regras de hoje ficam no cinza, como referência; a
 regressão logística é violeta, e o LightGBM, verde.
+
+Nas figuras da decisão, as saídas têm as cores de estado, sempre com o nome
+escrito: segurar é o amarelo de alerta, e bloquear, o vermelho. O modelo com a
+idade, que saiu, fica no cinza, ao lado do verde do LightGBM sem ela.
 """
 
 from collections.abc import Callable
@@ -17,8 +21,9 @@ from pathlib import Path
 from typing import Any
 
 import matplotlib as mpl
+import numpy as np
 import polars as pl
-from matplotlib.colors import LinearSegmentedColormap
+from matplotlib.colors import LinearSegmentedColormap, ListedColormap
 from matplotlib.figure import Figure
 from matplotlib.layout_engine import ConstrainedLayoutEngine
 from matplotlib.patches import Rectangle
@@ -26,8 +31,12 @@ from matplotlib.ticker import FuncFormatter, MultipleLocator
 
 from antifraude_pix.analise import retrato, separacao
 from antifraude_pix.avaliacao import metricas
+from antifraude_pix.avaliacao.decisoes import NOMES as NOMES_DAS_POLITICAS
+from antifraude_pix.avaliacao.decisoes import balanco, com_a_politica
+from antifraude_pix.avaliacao.justica import por_idade
 from antifraude_pix.avaliacao.no_tempo import Rotulo, avaliar
 from antifraude_pix.dados.banco import VisaoDoBanco
+from antifraude_pix.decisao.custo import Custos, decidir
 from antifraude_pix.modelos.rotulo import Dobra, dobras, primeiro_corte
 from antifraude_pix.modelos.treino import MODELOS
 from antifraude_pix.modelos.treino import NOMES as NOMES_DOS_MODELOS
@@ -35,6 +44,10 @@ from antifraude_pix.simulacao.golpes import GOLPES, NOMES, Golpe
 from antifraude_pix.simulacao.simulador import Simulacao
 from antifraude_pix.variaveis.calculo import calcular
 from antifraude_pix.variaveis.catalogo import CATALOGO
+
+SEGURAR = "#fab219"
+BLOQUEAR = "#d03b3b"
+SEM_A_IDADE = "#008300"
 
 SUPERFICIE = "#fcfcfb"
 TINTA = "#0b0b0b"
@@ -538,6 +551,219 @@ def rotulo_atrasado(do_dia: pl.DataFrame, com_a_verdade: pl.DataFrame) -> Figure
     return figura
 
 
+def mapa_da_decisao(pontuacoes: pl.DataFrame, custos: Custos | None = None) -> Figure:
+    """As três saídas no plano do valor e da chance de golpe, com os Pix de teste do LightGBM por cima."""
+    custos = custos or Custos()
+    valores, chances = np.logspace(0, np.log10(30_000), 500), np.logspace(-6, 0, 600)
+    em_valor, em_chance = np.meshgrid(valores, chances)
+    grade = decidir(pl.DataFrame({"probabilidade": em_chance.ravel(), "valor": em_valor.ravel()}), custos)
+    saidas = grade["acao"].to_physical().to_numpy().reshape(em_chance.shape)
+    lightgbm = pontuacoes.filter(pl.col("modelo") == "lightgbm")
+    golpes = lightgbm.filter(pl.col("golpe").is_not_null())
+    honestos = lightgbm.filter(pl.col("golpe").is_null())
+    amostra = honestos.sample(n=min(5_000, honestos.height), seed=2026)
+
+    def no_quadro(pix: pl.DataFrame) -> tuple[np.ndarray, np.ndarray]:
+        # O Pix de mais de R$ 30.000 fica na borda direita do quadro, e não fora dele.
+        return np.clip(pix["valor"].to_numpy(), 1.0, 30_000.0), pix["probabilidade"].to_numpy()
+
+    with mpl.rc_context(_ESTILO):
+        figura = _figura(6.2)
+        quadro = figura.subplots()
+        tons = ListedColormap([_misturar(GRADE, 0.5), _misturar(SEGURAR, 0.35), _misturar(BLOQUEAR, 0.3)])
+        quadro.pcolormesh(em_valor, em_chance, saidas, cmap=tons, vmin=-0.5, vmax=2.5, shading="auto", zorder=0)
+        quadro.scatter(
+            *no_quadro(amostra), s=3, color=MUDO, alpha=0.6, linewidths=0, label="Pix honestos, 5 mil sorteados"
+        )
+        quadro.scatter(
+            *no_quadro(golpes),
+            s=14,
+            color=TINTA,
+            edgecolors=SUPERFICIE,
+            linewidths=0.5,
+            label=f"os {_numero(golpes.height)} golpes",
+        )
+
+        regioes = (
+            (5.0, 1e-3, "aprovar", _misturar(GRADE, 0.5)),
+            (6_000.0, 2e-2, "segurar para confirmar", _misturar(SEGURAR, 0.35)),
+            (7_000.0, 0.25, "bloquear", _misturar(BLOQUEAR, 0.3)),
+        )
+
+        for valor, chance, nome, fundo in regioes:
+            quadro.text(
+                valor,
+                chance,
+                nome,
+                fontsize=12,
+                fontweight="bold",
+                color=TINTA,
+                ha="center",
+                va="center",
+                bbox={"boxstyle": "round,pad=0.25", "facecolor": fundo, "edgecolor": "none"},
+                zorder=3,
+            )
+
+        quadro.set_xscale("log")
+        quadro.set_yscale("log")
+        quadro.set_xlim(1, 30_000)
+        quadro.set_ylim(1e-6, 1)
+        quadro.set_xticks([1, 10, 100, 1_000, 10_000], ["R$ 1", "R$ 10", "R$ 100", "R$ 1.000", "R$ 10.000"])
+        marcas = [1e-6, 1e-5, 1e-4, 1e-3, 1e-2, 0.1, 1.0]
+        quadro.set_yticks(marcas, ["0,0001%", "0,001%", "0,01%", "0,1%", "1%", "10%", "100%"])
+        quadro.grid(visible=False)
+        quadro.set_xlabel("O valor do Pix")
+        quadro.set_ylabel("A chance de golpe, calibrada")
+        quadro.legend(frameon=False, loc="upper left", fontsize=9, markerscale=1.5)
+        _titulo(
+            figura,
+            "O mapa da decisão",
+            "A saída de menor custo para cada valor e cada chance de golpe. Os pontos são os Pix de outubro a "
+            "dezembro, pelo LightGBM.",
+        )
+
+    return figura
+
+
+def custo_das_politicas(pontuacoes: pl.DataFrame, custos: Custos | None = None) -> Figure:
+    """O custo de fato de cada jeito de decidir, com o LightGBM, do mais caro ao mais barato."""
+    linhas = sorted(
+        balanco(pontuacoes.filter(pl.col("modelo") == "lightgbm"), custos).iter_rows(named=True),
+        key=lambda linha: -linha["custo"],
+    )
+
+    with mpl.rc_context(_ESTILO):
+        figura = _figura(4.4)
+        quadro = figura.subplots()
+        maior = linhas[0]["custo"]
+
+        for posicao, linha in enumerate(linhas):
+            escolhida = linha["politica"] == "custo"
+            quadro.barh(posicao, linha["custo"], height=0.6, color=SEM_A_IDADE if escolhida else MUDO)
+            partes = [f"{_mil(linha['perdido'])} em golpes que passaram"]
+
+            if linha["honestos_segurados"]:
+                partes.append(f"{_numero(linha['honestos_segurados'])} honestos segurados")
+
+            if linha["honestos_bloqueados"]:
+                partes.append(f"{_numero(linha['honestos_bloqueados'])} honestos bloqueados")
+
+            detalhe = "; ".join(partes)
+            quadro.text(
+                linha["custo"] + maior * 0.01,
+                posicao - 0.1,
+                _mil(linha["custo"]),
+                va="center",
+                fontsize=11,
+                fontweight="bold",
+                color=TINTA,
+            )
+            quadro.text(
+                linha["custo"] + maior * 0.01, posicao + 0.2, detalhe, va="center", fontsize=8, color=TINTA_SECUNDARIA
+            )
+
+        quadro.set_yticks(range(len(linhas)), [NOMES_DAS_POLITICAS[linha["politica"]].capitalize() for linha in linhas])
+        quadro.invert_yaxis()
+        quadro.set_xlim(0, maior * 1.45)
+        quadro.set_xticks([0, 500_000, 1_000_000, 1_500_000], ["0", "R$ 500 mil", "R$ 1 milhão", "R$ 1,5 milhão"])
+        quadro.grid(axis="y", visible=False)
+        quadro.tick_params(axis="y", length=0)
+        quadro.spines["left"].set_visible(False)
+        _titulo(
+            figura,
+            "O custo de cada jeito de decidir",
+            "O custo de fato dos três meses de teste, com o LightGBM: os golpes que passaram, as confirmações e "
+            "os bloqueios de clientes honestos.",
+        )
+
+    return figura
+
+
+def erros_por_idade(com_a_idade: pl.DataFrame, sem_a_idade: pl.DataFrame, idades: pl.DataFrame) -> Figure:
+    """Os dois erros em cada faixa de idade, pelo custo, com o LightGBM que via a idade e com o que não vê."""
+
+    def tabela(pontuacoes: pl.DataFrame) -> pl.DataFrame:
+        decididas = com_a_politica(pontuacoes.filter(pl.col("modelo") == "lightgbm"), "custo")
+        return por_idade(decididas.join(idades, on="id"))
+
+    tabelas = {"com a idade, como era": tabela(com_a_idade), "sem a idade, como ficou": tabela(sem_a_idade)}
+    cores = dict(zip(tabelas, (MUDO, SEM_A_IDADE), strict=True))
+    paineis: tuple[tuple[str, str, int | None], ...] = (
+        ("recall", "Os golpes pegos", None),
+        ("honestos_segurados", "Os honestos segurados,\na cada 10 mil Pix", 1),
+        ("honestos_bloqueados", "Os honestos bloqueados,\na cada 10 mil Pix", 2),
+    )
+    faixas = next(iter(tabelas.values()))["faixa"].cast(pl.String).to_list()
+    largura = 0.36
+
+    with mpl.rc_context(_ESTILO):
+        figura = _figura(4.6)
+        quadros = figura.subplots(1, 3, sharey=True)
+
+        for quadro, (coluna, titulo, casas) in zip(quadros, paineis, strict=True):
+            maior = max(max(dela[coluna].to_list()) for dela in tabelas.values())
+
+            def escrever(valor: float, casas: int | None = casas) -> str:
+                # A parte dos golpes vai em porcentagem; os honestos, em número com as casas do painel.
+                return _porcentagem(valor) if casas is None else _decimal_curto(valor, casas)
+
+            for indice, (nome, dela) in enumerate(tabelas.items()):
+                posicoes = [posicao + (indice - 0.5) * (largura + 0.04) for posicao in range(len(faixas))]
+                alturas = dela[coluna].to_list()
+                quadro.barh(posicoes, alturas, height=largura, color=cores[nome], label=nome)
+
+                for posicao, altura in zip(posicoes, alturas, strict=True):
+                    quadro.text(altura + maior * 0.03, posicao, escrever(altura), va="center", fontsize=8, color=TINTA)
+
+            quadro.set_title(titulo, fontsize=10, loc="left")
+            quadro.set_xlim(0, maior * 1.35)
+            quadro.set_xticks([])
+            quadro.grid(visible=False)
+            quadro.tick_params(axis="y", length=0)
+            quadro.spines["left"].set_visible(False)
+            quadro.spines["bottom"].set_visible(False)
+
+        quadros[0].set_yticks(
+            range(len(faixas)),
+            [faixa.replace(" ou mais", "") + " anos" + (" ou mais" if "ou mais" in faixa else "") for faixa in faixas],
+        )
+        quadros[0].invert_yaxis()
+        marcas, nomes = quadros[0].get_legend_handles_labels()
+        figura.legend(marcas, nomes, frameon=False, loc="outside lower center", ncols=2, fontsize=9)
+        _titulo(
+            figura,
+            "Os erros com cada idade",
+            "Pelo custo, com o LightGBM. Com a idade, o modelo bloqueava o honesto de 65 anos ou mais 19 vezes mais "
+            "que o de 18 a 34.",
+        )
+
+    return figura
+
+
+def _misturar(cor: str, parte: float) -> str:
+    """A cor misturada à superfície: a parte dela, e o resto da superfície. É o tom de fundo de uma região."""
+    de = [int(cor[i : i + 2], 16) for i in (1, 3, 5)]
+    para = [int(SUPERFICIE[i : i + 2], 16) for i in (1, 3, 5)]
+
+    return "#" + "".join(f"{round(a * parte + b * (1 - parte)):02x}" for a, b in zip(de, para, strict=True))
+
+
+def _mil(valor: float) -> str:
+    """O dinheiro em mil e em milhão: R$ 101 mil, R$ 1,76 milhão."""
+    if valor >= 1_000_000:
+        return f"R$ {valor / 1_000_000:.2f} milhão".replace(".", ",")
+
+    return f"R$ {valor / 1_000:.0f} mil"
+
+
+def _numero(valor: int) -> str:
+    return f"{valor:,}".replace(",", ".")
+
+
+def _decimal_curto(valor: float, casas: int) -> str:
+    return f"{valor:.{casas}f}".replace(".", ",")
+
+
 def _decimal(valor: float) -> str:
     """Três casas: a invasão de conta fica entre 0,995 e 0,996, e duas casas a mostrariam como 0,99 e 1,00."""
     return f"{valor:.3f}".replace(".", ",")
@@ -591,6 +817,15 @@ class Insumos:
     def com_a_verdade(self) -> pl.DataFrame:
         return avaliar(self.simulacao, self.variaveis, self.dobras, modelos=("lightgbm",), rotulo=Rotulo.VERDADE)
 
+    @cached_property
+    def com_a_idade(self) -> pl.DataFrame:
+        """O LightGBM como era na Parte 3, recebendo a idade: só para medir o que mudou sem ela (ADR-0011)."""
+        return avaliar(self.simulacao, self.variaveis, self.dobras, modelos=("lightgbm",), entrada=CATALOGO)
+
+    @cached_property
+    def idades(self) -> pl.DataFrame:
+        return self.variaveis.select("id", "idade")
+
 
 FIGURAS: dict[str, Callable[[Insumos], Figure]] = {
     "horas": lambda insumos: horas(insumos.simulacao),
@@ -602,6 +837,9 @@ FIGURAS: dict[str, Callable[[Insumos], Figure]] = {
     "golpes_por_modelo": lambda insumos: golpes_por_modelo(insumos.pontuacoes),
     "calibracao": lambda insumos: calibracao(insumos.pontuacoes),
     "rotulo_atrasado": lambda insumos: rotulo_atrasado(insumos.pontuacoes, insumos.com_a_verdade),
+    "mapa_da_decisao": lambda insumos: mapa_da_decisao(insumos.pontuacoes),
+    "custo_das_politicas": lambda insumos: custo_das_politicas(insumos.pontuacoes),
+    "erros_por_idade": lambda insumos: erros_por_idade(insumos.com_a_idade, insumos.pontuacoes, insumos.idades),
 }
 
 

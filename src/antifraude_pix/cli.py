@@ -3,7 +3,8 @@
 - `simular` gera os dados;
 - `validar` os confere;
 - `variaveis` calcula as variáveis de cada Pix;
-- `avaliar` treina os modelos mês a mês com o rótulo do dia, e os mede contra a verdade.
+- `avaliar` treina os modelos mês a mês com o rótulo do dia, e os mede contra a verdade;
+- `decidir` decide cada Pix pelo custo, explica cada decisão em português, e mede o custo e os erros por idade.
 """
 
 import argparse
@@ -15,11 +16,16 @@ from pathlib import Path
 
 import polars as pl
 
+from antifraude_pix.avaliacao.decisoes import NOMES as NOMES_DAS_POLITICAS
+from antifraude_pix.avaliacao.decisoes import balanco
+from antifraude_pix.avaliacao.justica import por_idade
 from antifraude_pix.avaliacao.metricas import ALERTA, resumo
-from antifraude_pix.avaliacao.no_tempo import avaliar
+from antifraude_pix.avaliacao.no_tempo import avaliar, com_a_verdade, treinados
 from antifraude_pix.dados.banco import VisaoDoBanco
 from antifraude_pix.dados.gravacao import gravar, ler, ler_o_banco
 from antifraude_pix.dados.validacao import problemas
+from antifraude_pix.decisao.custo import Acao, decidir
+from antifraude_pix.decisao.explicacao import explicar
 from antifraude_pix.modelos.rotulo import Dobra, dobras, primeiro_corte
 from antifraude_pix.modelos.treino import NOMES as NOMES_DOS_MODELOS
 from antifraude_pix.simulacao.configuracao import Configuracao
@@ -44,6 +50,9 @@ def principal(argumentos: Sequence[str] | None = None) -> int:
 
     if pedido.comando == "avaliar":
         return _avaliar(pedido.pasta, pedido.saida)
+
+    if pedido.comando == "decidir":
+        return _decidir(pedido.pasta, pedido.saida)
 
     return _validar(pedido.pasta)
 
@@ -96,6 +105,17 @@ def _leitor() -> argparse.ArgumentParser:
     )
     avaliar_.add_argument(
         "--saida", type=Path, help="o arquivo das pontuações (padrão: avaliacao.parquet, na pasta dos dados)"
+    )
+
+    decidir_ = comandos.add_parser(
+        "decidir",
+        help="decide cada Pix de teste pelo custo, explica cada decisão, e mede o custo e os erros por idade",
+    )
+    decidir_.add_argument(
+        "pasta", type=Path, nargs="?", default=Path("dados"), help="a pasta dos dados (padrão: dados)"
+    )
+    decidir_.add_argument(
+        "--saida", type=Path, help="o arquivo das decisões (padrão: decisoes.parquet, na pasta dos dados)"
     )
 
     return leitor
@@ -179,15 +199,10 @@ def _avaliar(pasta: Path, saida: Path | None) -> int:
 
     comeco = time.perf_counter()
     visao = VisaoDoBanco.da(simulacao)
-    ultimo = visao.transacoes["momento"].max()
-    as_dobras = dobras(primeiro_corte(visao), ultimo.date()) if isinstance(ultimo, datetime) else ()
+    as_dobras = _as_dobras(visao)
 
     if not as_dobras:
-        print(
-            f"antifraude-pix avaliar: os dados de {pasta} não chegam a um mês de teste. Antes dele, são precisos "
-            "o aquecimento, um mês de treino e um mês de validação.",
-            file=sys.stderr,
-        )
+        _sem_mes_de_teste("avaliar", pasta)
         return 1
 
     pontuacoes = avaliar(simulacao, calcular(visao), as_dobras)
@@ -199,6 +214,158 @@ def _avaliar(pasta: Path, saida: Path | None) -> int:
     print(f"Pontuações gravadas em {destino}, em {_numero(round(time.perf_counter() - comeco))} s.")
 
     return 0
+
+
+def _decidir(pasta: Path, saida: Path | None) -> int:
+    """Decide pelo custo cada Pix dos meses de teste, com o LightGBM de cada mês, e explica cada decisão (ADR-0010).
+
+    Mede contra a verdade o custo de cada jeito de decidir e os erros em cada faixa de idade (ADR-0011).
+    """
+    try:
+        simulacao = ler(pasta)
+    except (OSError, ValueError, KeyError) as erro:
+        print(f"antifraude-pix decidir: não consegui ler {pasta}: {erro}", file=sys.stderr)
+        return 1
+
+    comeco = time.perf_counter()
+    visao = VisaoDoBanco.da(simulacao)
+    as_dobras = _as_dobras(visao)
+
+    if not as_dobras:
+        _sem_mes_de_teste("decidir", pasta)
+        return 1
+
+    variaveis = calcular(visao)
+    partes = []
+
+    for dobra, teste, modelos in treinados(simulacao, variaveis, as_dobras, modelos=("lightgbm",)):
+        modelo = modelos["lightgbm"]
+        pontuacao = modelo.pontuar(teste)
+        decididos = decidir(
+            teste.with_columns(
+                pl.Series("pontuacao", pontuacao), pl.Series("probabilidade", modelo.probabilidade_da(pontuacao))
+            )
+        )
+        partes.append(
+            explicar(modelo, decididos).select(
+                "id",
+                pl.lit(dobra.corte).alias("corte"),
+                pl.lit("lightgbm").alias("modelo"),
+                "pontuacao",
+                "probabilidade",
+                "valor",
+                "idade",
+                "acao",
+                "explicacao",
+            )
+        )
+
+    decisoes = com_a_verdade(simulacao, pl.concat(partes))
+    destino = saida or pasta / "decisoes.parquet"
+    destino.parent.mkdir(parents=True, exist_ok=True)
+    decisoes.write_parquet(destino, compression="zstd")
+
+    print(_quadro_das_decisoes(decisoes, as_dobras))
+    print(f"Decisões gravadas em {destino}, em {_numero(round(time.perf_counter() - comeco))} s.")
+
+    return 0
+
+
+def _as_dobras(visao: VisaoDoBanco) -> tuple[Dobra, ...]:
+    ultimo = visao.transacoes["momento"].max()
+
+    return dobras(primeiro_corte(visao), ultimo.date()) if isinstance(ultimo, datetime) else ()
+
+
+def _sem_mes_de_teste(comando: str, pasta: Path) -> None:
+    print(
+        f"antifraude-pix {comando}: os dados de {pasta} não chegam a um mês de teste. Antes dele, são precisos "
+        "o aquecimento, um mês de treino e um mês de validação.",
+        file=sys.stderr,
+    )
+
+
+def _quadro_das_decisoes(decisoes: pl.DataFrame, as_dobras: tuple[Dobra, ...]) -> str:
+    """O resumo das decisões em texto: o custo de cada jeito de decidir, os erros por idade e uma explicação de cada."""
+    golpe = pl.col("golpe").is_not_null()
+    golpes = decisoes.filter(golpe)
+    ultimo_dia = as_dobras[-1].fim - timedelta(days=1)
+    meses = "mês" if len(as_dobras) == 1 else "meses"
+    acoes = pl.col("acao").cast(pl.String)
+    segurados = decisoes.filter(acoes == Acao.SEGURAR.value).height
+    bloqueados = decisoes.filter(acoes == Acao.BLOQUEAR.value).height
+    linhas = [
+        f"Decisões de {as_dobras[0].corte:%d/%m/%Y} a {ultimo_dia:%d/%m/%Y}, em {len(as_dobras)} {meses}: "
+        f"{_numero(decisoes.height)} Pix, {_numero(golpes.height)} de golpe, "
+        f"que somam {_reais(float(golpes['valor'].sum()))}.",
+        "Em cada mês, o LightGBM treinado com o que o banco sabia na véspera; em cada Pix, a saída de menor custo "
+        "esperado.",
+        f"Pelo custo, o banco segurou {_numero(segurados)} Pix para confirmar "
+        f"({_porcentagem(segurados / decisoes.height)}) e bloqueou {_numero(bloqueados)} "
+        f"({_porcentagem(bloqueados / decisoes.height)}).",
+        "",
+        _linha(
+            ("", 28, "<"),
+            ("custo", 14, ">"),
+            ("perdido em golpes", 19, ">"),
+            ("golpes parados", 16, ">"),
+            ("honestos segurados", 20, ">"),
+            ("honestos bloqueados", 21, ">"),
+        ),
+    ]
+
+    for linha in balanco(decisoes.drop("acao")).iter_rows(named=True):
+        linhas.append(
+            _linha(
+                (NOMES_DAS_POLITICAS[linha["politica"]], 28, "<"),
+                (_reais(linha["custo"]), 14, ">"),
+                (_reais(linha["perdido"]), 19, ">"),
+                (_numero(round(linha["golpes_parados"])), 16, ">"),
+                (_numero(linha["honestos_segurados"]), 20, ">"),
+                (_numero(linha["honestos_bloqueados"]), 21, ">"),
+            )
+        )
+
+    linhas += [
+        "",
+        "Os erros por idade, pelo custo:",
+        "",
+        _linha(
+            ("", 14, "<"),
+            ("golpes pegos", 14, ">"),
+            ("honestos segurados a cada 10 mil", 34, ">"),
+            ("honestos bloqueados a cada 10 mil", 35, ">"),
+        ),
+    ]
+
+    for linha in por_idade(decisoes).iter_rows(named=True):
+        linhas.append(
+            _linha(
+                (linha["faixa"], 14, "<"),
+                (_porcentagem(linha["recall"], casas=0), 14, ">"),
+                (_decimal(linha["honestos_segurados"], casas=1), 34, ">"),
+                (_decimal(linha["honestos_bloqueados"], casas=2), 35, ">"),
+            )
+        )
+
+    exemplos = (
+        ("Um golpe bloqueado", golpe & (acoes == Acao.BLOQUEAR.value)),
+        ("Um golpe segurado", golpe & (acoes == Acao.SEGURAR.value)),
+        ("Um Pix honesto segurado", ~golpe & (acoes == Acao.SEGURAR.value)),
+    )
+    linhas.append("")
+
+    for titulo, filtro in exemplos:
+        escolhidos = decisoes.filter(filtro)
+
+        if escolhidos.height:
+            linhas.append(f"{titulo}: {escolhidos['explicacao'][0]}")
+
+    return "\n".join(linhas)
+
+
+def _linha(*colunas: tuple[str, int, str]) -> str:
+    return "".join(f"{texto:{lado}{largura}}" for texto, largura, lado in colunas)
 
 
 def _quadro(pontuacoes: pl.DataFrame, as_dobras: tuple[Dobra, ...]) -> str:
@@ -279,6 +446,10 @@ def _porcentagem(fracao: float, casas: int = 2) -> str:
 
 def _decimal(valor: float, casas: int = 2) -> str:
     return f"{valor:.{casas}f}".replace(".", ",")
+
+
+def _reais(valor: float) -> str:
+    return f"R$ {_numero(round(valor))}"
 
 
 if __name__ == "__main__":

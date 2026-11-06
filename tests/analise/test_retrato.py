@@ -83,5 +83,8 @@ def test_as_figuras_sao_gravadas_em_png(simulacao: Simulacao, tmp_path: Path) ->
         "golpes_por_modelo.png",
         "calibracao.png",
         "rotulo_atrasado.png",
+        "mapa_da_decisao.png",
+        "custo_das_politicas.png",
+        "erros_por_idade.png",
     ]
     assert all(figura.read_bytes().startswith(b"\x89PNG") for figura in gravadas)
