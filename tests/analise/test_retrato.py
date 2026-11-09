@@ -8,6 +8,7 @@ from antifraude_pix.analise import figuras, retrato
 from antifraude_pix.modelos.rotulo import Dobra
 from antifraude_pix.simulacao.golpes import GOLPES
 from antifraude_pix.simulacao.simulador import Simulacao
+from tests.apoio import cartoes_inventados
 
 
 def test_cada_grupo_tem_as_24_horas_e_elas_somam_tudo(simulacao: Simulacao) -> None:
@@ -71,7 +72,8 @@ def test_os_rotulos_proximos_se_afastam_sem_mudar_de_ordem() -> None:
 
 def test_as_figuras_sao_gravadas_em_png(simulacao: Simulacao, tmp_path: Path) -> None:
     # A simulação média termina em setembro: o teste dos modelos é setembro, sem o mês de validação.
-    gravadas = figuras.gerar(simulacao, tmp_path, (Dobra(date(2025, 9, 1), date(2025, 9, 29)),))
+    cartoes = cartoes_inventados(tmp_path / "cartoes")
+    gravadas = figuras.gerar(simulacao, tmp_path, (Dobra(date(2025, 9, 1), date(2025, 9, 29)),), cartoes)
 
     assert [figura.name for figura in gravadas] == [
         "horas.png",
@@ -86,5 +88,6 @@ def test_as_figuras_sao_gravadas_em_png(simulacao: Simulacao, tmp_path: Path) ->
         "mapa_da_decisao.png",
         "custo_das_politicas.png",
         "erros_por_idade.png",
+        "fraudes_nos_cartoes.png",
     ]
     assert all(figura.read_bytes().startswith(b"\x89PNG") for figura in gravadas)

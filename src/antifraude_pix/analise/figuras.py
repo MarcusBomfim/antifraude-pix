@@ -18,7 +18,7 @@ from collections.abc import Callable
 from datetime import datetime, timedelta
 from functools import cached_property
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import matplotlib as mpl
 import numpy as np
@@ -35,6 +35,10 @@ from antifraude_pix.avaliacao.decisoes import NOMES as NOMES_DAS_POLITICAS
 from antifraude_pix.avaliacao.decisoes import balanco, com_a_politica
 from antifraude_pix.avaliacao.justica import por_idade
 from antifraude_pix.avaliacao.no_tempo import Rotulo, avaliar
+from antifraude_pix.cartoes.base import ler as ler_os_cartoes
+from antifraude_pix.cartoes.processo import MODELOS as MODELOS_DOS_CARTOES
+from antifraude_pix.cartoes.processo import NOMES as NOMES_NOS_CARTOES
+from antifraude_pix.cartoes.processo import avaliar as avaliar_os_cartoes
 from antifraude_pix.dados.banco import VisaoDoBanco
 from antifraude_pix.decisao.custo import Custos, decidir
 from antifraude_pix.modelos.rotulo import Dobra, dobras, primeiro_corte
@@ -67,7 +71,8 @@ CORES: dict[str, str] = {
     "conta laranja": "#e34948",
 }
 
-CORES_DOS_MODELOS: dict[str, str] = {"regras": MUDO, "logistica": "#6250d6", "lightgbm": "#008300"}
+CORES_DOS_MODELOS: dict[str, str] = {"regras": MUDO, "valor": MUDO, "logistica": "#6250d6", "lightgbm": "#008300"}
+"""O ponto de partida no cinza: as regras de hoje no Pix, e o valor sozinho nos cartões."""
 MODELOS_EM_ORDEM: tuple[str, ...] = tuple(MODELOS)
 
 AZUIS = (
@@ -347,8 +352,21 @@ def forca_das_variaveis(simulacao: Simulacao, variaveis: pl.DataFrame) -> Figure
     return figura
 
 
-def golpes_pegos(pontuacoes: pl.DataFrame) -> Figure:
-    """A parte dos golpes que cada modelo pega, para cada parte dos Pix que o banco segura, com o alerta marcado."""
+def golpes_pegos(
+    pontuacoes: pl.DataFrame,
+    *,
+    modelos: tuple[str, ...] = MODELOS_EM_ORDEM,
+    nomes: dict[str, str] = NOMES_DOS_MODELOS,
+    eixo: str = "A parte dos Pix segurados para confirmar, dos de mais cara de golpe para baixo",
+    titulo: str = "Os golpes que cada modelo pega",
+    subtitulo: str = "A parte dos golpes dos meses de teste que cada modelo pega, para cada parte dos Pix que o banco "
+    "segura.",
+    legenda: Literal["lower right", "center right"] = "lower right",
+) -> Figure:
+    """A parte dos golpes que cada modelo pega, para cada parte dos Pix que o banco segura, com o alerta marcado.
+
+    A mesma figura serve à base de cartões, com os modelos, os nomes e os textos dela.
+    """
     curva = metricas.curva_do_alerta(pontuacoes)
     alerta = metricas.ALERTA
     no_alerta = {
@@ -359,7 +377,7 @@ def golpes_pegos(pontuacoes: pl.DataFrame) -> Figure:
         figura = _figura(4.8)
         quadro = figura.subplots()
 
-        for modelo in MODELOS:
+        for modelo in modelos:
             dele = curva.filter(pl.col("modelo") == modelo)
             # A curva começa na origem: sem segurar nenhum Pix, nenhum golpe.
             x = [1e-5, *dele["parte_segurada"].to_list()]
@@ -374,7 +392,7 @@ def golpes_pegos(pontuacoes: pl.DataFrame) -> Figure:
                 markersize=8,
                 markeredgecolor=SUPERFICIE,
                 markeredgewidth=2,
-                label=f"{NOMES_DOS_MODELOS[modelo]}: {_porcentagem(pegos)}",
+                label=f"{nomes[modelo]}: {_porcentagem(pegos)}",
             )
 
         quadro.axvline(alerta, color=EIXO, linewidth=1, zorder=0)
@@ -383,28 +401,39 @@ def golpes_pegos(pontuacoes: pl.DataFrame) -> Figure:
         quadro.set_xlim(1e-4, 0.1)
         quadro.set_ylim(0, 1.02)
         quadro.set_xticks([1e-4, 1e-3, 1e-2, 0.1], ["0,01%", "0,1%", "1%", "10%"])
-        quadro.set_xlabel("A parte dos Pix segurados para confirmar, dos de mais cara de golpe para baixo")
+        quadro.set_xlabel(eixo)
         quadro.yaxis.set_major_formatter(FuncFormatter(_porcentagem))
         # A legenda traz o número do alerta, no canto que as curvas deixam vazio.
-        ordem = sorted(range(len(MODELOS)), key=lambda indice: -no_alerta[MODELOS_EM_ORDEM[indice]])
-        marcas, nomes = quadro.get_legend_handles_labels()
+        ordem = sorted(range(len(modelos)), key=lambda indice: -no_alerta[modelos[indice]])
+        marcas, rotulos = quadro.get_legend_handles_labels()
         quadro.legend(
             [marcas[indice] for indice in ordem],
-            [nomes[indice] for indice in ordem],
+            [rotulos[indice] for indice in ordem],
             title="No alerta de 0,5%:",
             title_fontsize=9,
             alignment="left",
             frameon=False,
-            loc="lower right",
+            loc=legenda,
             fontsize=10,
         )
-        _titulo(
-            figura,
-            "Os golpes que cada modelo pega",
-            "A parte dos golpes dos meses de teste que cada modelo pega, para cada parte dos Pix que o banco segura.",
-        )
+        _titulo(figura, titulo, subtitulo)
 
     return figura
+
+
+def fraudes_nos_cartoes(pontuacoes: pl.DataFrame) -> Figure:
+    """A parte das fraudes que cada modelo pega na base de cartões, com o mesmo alerta do Pix (ADR-0015)."""
+    return golpes_pegos(
+        pontuacoes,
+        modelos=MODELOS_DOS_CARTOES,
+        nomes=NOMES_NOS_CARTOES,
+        eixo="A parte das compras seguradas para confirmar, das de mais cara de fraude para baixo",
+        titulo="As fraudes que cada modelo pega, nos cartões",
+        subtitulo="Na base pública da ULB, com o treino no primeiro dia, o teste no segundo, e os mesmos parâmetros "
+        "do Pix.",
+        # Embaixo, à direita, passa a curva do valor sozinho; no meio, à direita, não passa nada.
+        legenda="center right",
+    )
 
 
 def golpes_por_modelo(pontuacoes: pl.DataFrame) -> Figure:
@@ -789,9 +818,20 @@ def _afastados(alturas: dict[str, float], distancia: float) -> dict[str, float]:
 class Insumos:
     """O que as figuras pedem, calculado uma vez só, e só quando alguma figura pede: as variáveis e as avaliações."""
 
-    def __init__(self, simulacao: Simulacao, as_dobras: tuple[Dobra, ...] | None = None) -> None:
+    def __init__(
+        self, simulacao: Simulacao, as_dobras: tuple[Dobra, ...] | None = None, cartoes: Path | None = None
+    ) -> None:
         self.simulacao = simulacao
         self._dobras = as_dobras
+        self.arquivo_dos_cartoes = cartoes
+
+    @cached_property
+    def nos_cartoes(self) -> pl.DataFrame:
+        """As pontuações da base de cartões, do arquivo dado: a figura dos cartões só é desenhada com ele."""
+        if self.arquivo_dos_cartoes is None:
+            raise ValueError("A figura dos cartões pede o arquivo da base de cartões.")
+
+        return avaliar_os_cartoes(ler_os_cartoes(self.arquivo_dos_cartoes))
 
     @cached_property
     def variaveis(self) -> pl.DataFrame:
@@ -843,13 +883,25 @@ FIGURAS: dict[str, Callable[[Insumos], Figure]] = {
 }
 
 
-def gerar(simulacao: Simulacao, pasta: Path, as_dobras: tuple[Dobra, ...] | None = None) -> list[Path]:
-    """Desenha as figuras e as grava em PNG na pasta. As dobras da avaliação são as do padrão, se não vierem."""
-    pasta.mkdir(parents=True, exist_ok=True)
-    insumos = Insumos(simulacao, as_dobras)
-    gravadas = []
+FIGURAS_DOS_CARTOES: dict[str, Callable[[Insumos], Figure]] = {
+    "fraudes_nos_cartoes": lambda insumos: fraudes_nos_cartoes(insumos.nos_cartoes),
+}
+"""As figuras da base de cartões: só com o arquivo dela, que fica fora do repositório."""
 
-    for nome, desenhar in FIGURAS.items():
+
+def gerar(
+    simulacao: Simulacao, pasta: Path, as_dobras: tuple[Dobra, ...] | None = None, cartoes: Path | None = None
+) -> list[Path]:
+    """Desenha as figuras e as grava em PNG na pasta.
+
+    As dobras da avaliação são as do padrão, se não vierem. A figura dos cartões só sai com o arquivo da base.
+    """
+    pasta.mkdir(parents=True, exist_ok=True)
+    insumos = Insumos(simulacao, as_dobras, cartoes)
+    gravadas = []
+    todas = FIGURAS | (FIGURAS_DOS_CARTOES if cartoes is not None else {})
+
+    for nome, desenhar in todas.items():
         destino = pasta / f"{nome}.png"
         desenhar(insumos).savefig(destino, dpi=150)
         gravadas.append(destino)

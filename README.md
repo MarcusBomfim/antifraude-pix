@@ -3,9 +3,9 @@
 [![CI](https://github.com/MarcusBomfim/antifraude-pix/actions/workflows/ci.yml/badge.svg)](https://github.com/MarcusBomfim/antifraude-pix/actions/workflows/ci.yml)
 [![Licença: MIT](https://img.shields.io/badge/licen%C3%A7a-MIT-blue.svg)](LICENSE)
 
-Detecção de fraude em Pix, do lado do banco de quem paga: o banco tem alguns milissegundos para decidir se cada Pix sai, segura para confirmar ou é bloqueado. O projeto começa por um simulador de transações com os golpes que acontecem no Brasil — o falso parente, a falsa central, a invasão de conta e a venda falsa — e com o rótulo que o banco tem de verdade: a contestação, que chega dias depois e nem sempre chega. Sobre esses dados vêm as variáveis calculadas sem olhar o futuro, os modelos validados no tempo com o rótulo que o banco tinha no dia, e a decisão de cada Pix pelo custo, explicada em português e medida para não errar mais com os mais velhos. Nas próximas partes, vêm os experimentos rastreados e o serviço que pontua em tempo real.
+Detecção de fraude em Pix, do lado do banco de quem paga: o banco tem alguns milissegundos para decidir se cada Pix sai, segura para confirmar ou é bloqueado. O projeto começa por um simulador de transações com os golpes que acontecem no Brasil — o falso parente, a falsa central, a invasão de conta e a venda falsa — e com o rótulo que o banco tem de verdade: a contestação, que chega dias depois e nem sempre chega. Sobre esses dados vêm as variáveis calculadas sem olhar o futuro, os modelos validados no tempo com o rótulo que o banco tinha no dia, e a decisão de cada Pix pelo custo, explicada em português e medida para não errar mais com os mais velhos. Os experimentos ficam rastreados no MLflow, o modelo vai registrado com a sua ficha, e o mesmo processo roda numa base real, de cartões. Nas próximas partes, vêm o serviço que pontua em tempo real, o monitoramento e a entrega.
 
-Python 3.13 · uv · NumPy · Polars · Parquet · scikit-learn · LightGBM · matplotlib · pytest · hypothesis · ruff · mypy · GitHub Actions
+Python 3.13 · uv · NumPy · Polars · Parquet · scikit-learn · LightGBM · MLflow · matplotlib · pytest · hypothesis · ruff · mypy · GitHub Actions
 
 > Projeto independente, de estudo e portfólio. Não tem ligação com nenhum banco nem com o Banco Central. Os dados são de um simulador: não há nenhum dado real de cliente, nem nenhuma transação de verdade.
 
@@ -168,6 +168,54 @@ O golpe mira os mais velhos, e o modelo da Parte 3, que recebia a idade, aprende
 
 Sem a idade, o modelo pega os mesmos golpes contra os mais velhos (93%), e bloqueia o Pix honesto deles como o de qualquer idade. O custo subiu 0,9%. O honesto de 65 anos ou mais ainda é segurado quase três vezes mais, porque o golpe contra eles é quatro vezes mais comum, e o hábito deles se parece com o das vítimas. Cada Pix segurado de um idoso, por outro lado, é golpe mais vezes que o de um jovem.
 
+## Os experimentos, o modelo registrado e a base real
+
+Cada medida que decidiu o desenho dos modelos vira uma corrida no MLflow ([ADR-0013](docs/adr/0013-os-experimentos-rastreados-no-mlflow.md)): o padrão, o rótulo da verdade, a espera pelo rótulo e a idade no modelo. Cada corrida guarda:
+- **os dados**: a configuração da simulação, que dá os mesmos dados byte a byte;
+- **os parâmetros**: os do modelo, os do treino e os da decisão;
+- **as métricas**: as da fila, as de cada golpe, as da decisão e as de cada faixa de idade, e a precisão média mês a mês;
+- **o código**: o commit.
+
+| Variante | O LightGBM, de outubro a dezembro |
+|---|--:|
+| o padrão | 0,932 |
+| aprendendo com a verdade, que nenhum banco tem | 0,948 |
+| esperando 14 dias o rótulo amadurecer | 0,928 |
+| esperando 28 dias | 0,928 |
+| recebendo a idade, como na Parte 3 | 0,934 |
+
+O modelo que vai para o banco fica registrado no MLflow como `antifraude-pix`, com o apelido `campeao` ([ADR-0014](docs/adr/0014-o-modelo-registrado-com-a-ficha.md)). Ele é o LightGBM treinado com tudo o que o banco sabia no fim de 2025, num pacote só: entram as 32 variáveis de um Pix, e saem a probabilidade, a decisão e a explicação. O que ele aprendeu vai em formatos que se leem sem executar nada, e não em pickle:
+- as árvores, no texto do próprio LightGBM;
+- a calibração e os custos, em JSON.
+
+A [ficha do modelo](docs/ficha-do-modelo.md) diz o que ele faz e para que não serve, com que dados aprendeu, como foi medido e onde erra. Ela sai das próprias medidas, e vai junto com ele no registro.
+
+```python
+import mlflow
+
+modelo = mlflow.pyfunc.load_model("models:/antifraude-pix@campeao")
+decisoes = modelo.predict(variaveis)  # pontuacao, probabilidade, acao e explicacao
+```
+
+Não existe base pública de Pix. Por isso o mesmo processo roda na base pública de fraude mais usada, a de cartões da ULB ([ADR-0015](docs/adr/0015-a-base-publica-de-cartoes.md)):
+- são 284.807 compras de clientes europeus em dois dias de 2013, com 492 fraudes;
+- as variáveis são componentes principais, sem nome.
+
+O treino é o primeiro dia, e o teste, o segundo. Os modelos usam os parâmetros do Pix, sem ajuste nenhum, e a medida usa as mesmas funções.
+
+![As fraudes que cada modelo pega nos cartões: segurando 0,5% das compras, o LightGBM pega 84% das fraudes, a regressão logística 80% e o valor sozinho 1%](docs/imagens/fraudes_nos_cartoes.png)
+
+| | Precisão média | Fraudes pegas no alerta | Fraudes previstas | Custo pelo custo |
+|---|--:|--:|--:|--:|
+| o valor sozinho | 0,002 | 1% | 236 de 211 | € 27.069 |
+| a regressão logística | 0,66 | 80% | 241 de 211 | € 16.006 |
+| o LightGBM | 0,79 | 84% | 252 de 211 | € 11.613 |
+
+O processo se sustenta fora do simulador, e a ordem dos modelos é a mesma. A base real é mais difícil, e mostra o que o simulador não mostrava:
+- **o valor aponta para o lado errado**: a fraude com cartão é pequena, com mediana de € 9,21, contra € 20,33 da compra honesta;
+- **a taxa de fraude muda de um dia para o outro**, de 0,19% para 0,15%. A probabilidade calibrada no primeiro dia prevê fraude demais no segundo, e é a mudança que a Parte 7 vai vigiar;
+- **decidir pelo custo corta 57% do custo de aprovar tudo** (€ 26.889), e não 94%, como no Pix. Para a fraude de poucos euros, confirmar custaria mais que a fraude.
+
 ## Roteiro
 
 O projeto é construído em partes, cada uma entregue funcionando, testada e documentada.
@@ -178,7 +226,7 @@ O projeto é construído em partes, cada uma entregue funcionando, testada e doc
 | 2 | As variáveis sem olhar o futuro: o valor fora do hábito, a pressa, o recebedor novo, a conta que recebe de muitos desconhecidos, o aparelho novo — com testes que provam que não há vazamento | ✅ |
 | 3 | Os modelos: as regras de hoje como ponto de partida, a regressão logística e o LightGBM; a validação no tempo, com o rótulo que o banco tinha no dia; as métricas para classe rara; a probabilidade calibrada | ✅ |
 | 4 | A decisão e o porquê: aprovar, segurar para confirmar ou bloquear, pelo custo; a explicação em português de cada decisão; o modelo que não erra mais com os mais velhos | ✅ |
-| 5 | Os experimentos rastreados no MLflow, o modelo registrado com a sua ficha, e o mesmo processo numa base pública real, de cartões | |
+| 5 | Os experimentos rastreados no MLflow, o modelo registrado com a sua ficha, e o mesmo processo numa base pública real, de cartões | ✅ |
 | 6 | A pontuação em tempo real: a API em FastAPI, a latência medida, e o teste de que a API e o treino calculam as mesmas variáveis | |
 | 7 | O monitoramento: os dados que mudam, o rótulo que chega depois, o golpe novo, e o retreino comparando o modelo atual com o candidato | |
 | 8 | Docker, entrega contínua, OpenTelemetry e o painel | |
@@ -233,6 +281,17 @@ O projeto é construído em partes, cada uma entregue funcionando, testada e doc
   - pelos valores de Shapley no LightGBM, pelos pesos na regressão logística e pelos pontos nas regras;
   - a idade, que não entra no modelo, não tem frase.
 
+**Parte 5 — os experimentos, o modelo registrado e a base real**
+
+- **O rastreio no MLflow**, num banco SQLite ao lado dos dados: uma corrida por modelo de cada variante, com os dados, os parâmetros, as métricas e o commit.
+- **O modelo registrado**, com nome, versão e o apelido de campeão:
+  - a probabilidade, a decisão e a explicação num pacote só;
+  - as árvores em texto e os ajustes em JSON, sem pickle;
+  - a assinatura das 32 variáveis, com as que podem vir vazias;
+  - o código e as versões das bibliotecas.
+- **A ficha do modelo**, gerada das medidas.
+- **A base de cartões da ULB**, baixada do OpenML e conferida pelo MD5, com o mesmo processo do Pix e as mesmas métricas.
+
 ## Decisões
 
 As decisões que mudam o desenho do projeto estão registradas em [`docs/adr`](docs/adr):
@@ -249,6 +308,9 @@ As decisões que mudam o desenho do projeto estão registradas em [`docs/adr`](d
 - [ADR-0010](docs/adr/0010-a-decisao-pelo-custo.md) — a decisão pelo custo: aprovar, segurar para confirmar ou bloquear.
 - [ADR-0011](docs/adr/0011-a-idade-fora-do-modelo.md) — a idade fora do modelo, e os erros por idade.
 - [ADR-0012](docs/adr/0012-a-explicacao-em-portugues.md) — a explicação em português de cada decisão.
+- [ADR-0013](docs/adr/0013-os-experimentos-rastreados-no-mlflow.md) — os experimentos rastreados no MLflow.
+- [ADR-0014](docs/adr/0014-o-modelo-registrado-com-a-ficha.md) — o modelo registrado, com a sua ficha.
+- [ADR-0015](docs/adr/0015-a-base-publica-de-cartoes.md) — o mesmo processo numa base real: a de cartões da ULB.
 
 ## Testes
 
@@ -319,6 +381,22 @@ As decisões que mudam o desenho do projeto estão registradas em [`docs/adr`](d
   - na invasão de conta, o aparelho quase sempre está entre elas;
   - cada variável tem a sua frase para todo valor que aparece nos dados, e a idade não tem;
   - o pacote da decisão não importa o simulador nem a avaliação.
+- **O rastreio**:
+  - cada variante grava uma corrida por modelo, com as métricas iguais às da avaliação e com o que a variante muda;
+  - a precisão média vai mês a mês, e as tabelas vão como artefatos;
+  - o experimento é criado uma vez só, ao lado dos dados.
+- **O modelo registrado**:
+  - o campeão carregado do registro dá a mesma probabilidade que o modelo treinado, até a 12ª casa, e a mesma decisão;
+  - os custos e os tipos gravados voltam iguais;
+  - a assinatura tem as 32 variáveis, e as que podem vir vazias não são obrigatórias;
+  - faltando variável, o modelo diz qual;
+  - o lote em que todo Pix foi aprovado sai sem razões, e sem quebrar.
+- **A base de cartões**, numa base pequena inventada no formato do OpenML:
+  - a leitura, inclusive do número em notação científica;
+  - o download que confere o MD5, joga fora o arquivo que não confere, e não baixa de novo;
+  - o primeiro dia no treino e o segundo no teste;
+  - a calibração fora do ajuste;
+  - as métricas e a decisão do Pix medindo os cartões.
 - **A linha de comando e as figuras**: o que sai, o que é recusado, e as figuras gravadas.
 
 ## Como rodar
@@ -371,7 +449,31 @@ A decisão de cada Pix de teste pelo custo, com o LightGBM de cada mês, a expli
 uv run antifraude-pix decidir
 ```
 
-As figuras deste README, em uns quatro minutos:
+As medidas que decidiram o desenho dos modelos, refeitas e gravadas no MLflow, em uns cinco minutos:
+
+```bash
+uv run antifraude-pix experimentos
+```
+
+O MLflow mostra as corridas no navegador, em http://127.0.0.1:5000:
+
+```bash
+uv run mlflow ui --backend-store-uri sqlite:///dados/mlflow/mlflow.db
+```
+
+O modelo final, treinado com tudo, registrado no MLflow como o campeão, com a ficha gravada em `dados/ficha-do-modelo.md`, em uns dois minutos:
+
+```bash
+uv run antifraude-pix registrar
+```
+
+O mesmo processo na base de cartões da ULB, que o comando baixa do OpenML na primeira vez (151 MB):
+
+```bash
+uv run antifraude-pix cartoes
+```
+
+As figuras deste README, em uns quatro minutos. A dos cartões só sai depois que a base foi baixada:
 
 ```bash
 uv run python -m antifraude_pix.analise
@@ -427,6 +529,15 @@ src/antifraude_pix/
     metricas.py         as métricas para classe rara
     decisoes.py         o custo de fato de cada jeito de decidir
     justica.py          os erros em cada faixa de idade
+  rastreio/
+    experimentos.py     as variantes, e cada corrida no MLflow
+    registro.py         o modelo final, registrado com o apelido de campeão
+    modelo_do_pix.py    o modelo registrado, como código: entram as variáveis, sai a decisão explicada
+    ficha.py            a ficha do modelo, gerada das medidas
+  cartoes/
+    base.py             a base de cartões da ULB: o download conferido e a leitura
+    processo.py         o mesmo processo do Pix, nos cartões
+    rastreio.py         as corridas dos cartões no MLflow
   decisao/
     custo.py            aprovar, segurar ou bloquear: a saída de menor custo esperado
     explicacao.py       as razões de cada decisão, pela conta do próprio modelo
@@ -435,10 +546,11 @@ src/antifraude_pix/
     retrato.py          as contas do retrato de cada golpe
     separacao.py        a força de cada variável, sozinha, contra cada golpe
     figuras.py          as figuras do README
-  cli.py                antifraude-pix simular, validar, variaveis, avaliar e decidir
-tests/                  o simulador, os dados, as variáveis, os modelos, a avaliação, a decisão e as análises
+  cli.py                antifraude-pix simular, validar, variaveis, avaliar, decidir, experimentos, registrar e cartoes
+tests/                  o simulador, os dados, as variáveis, os modelos, a avaliação, a decisão, o rastreio, os cartões e as análises
 docs/adr/               decisões de arquitetura
-docs/imagens/           as figuras do retrato, da força das variáveis, dos modelos e da decisão
+docs/ficha-do-modelo.md a ficha do modelo registrado
+docs/imagens/           as figuras do retrato, da força das variáveis, dos modelos, da decisão e dos cartões
 ```
 
 ## Licença

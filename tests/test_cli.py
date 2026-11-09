@@ -1,11 +1,17 @@
+import hashlib
 from datetime import date
 from pathlib import Path
 
 import polars as pl
 import pytest
+from mlflow.tracking import MlflowClient
 
+from antifraude_pix.cartoes import base as base_dos_cartoes
 from antifraude_pix.cli import principal
+from antifraude_pix.rastreio.experimentos import EXPERIMENTO, VARIANTES, endereco
+from antifraude_pix.rastreio.registro import CAMPEAO, NOME
 from antifraude_pix.variaveis.catalogo import NOMES
+from tests.apoio import cartoes_inventados
 
 
 def test_simular_grava_os_dados_e_conta_o_que_saiu(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
@@ -153,3 +159,68 @@ def test_decidir_dados_curtos_demais_falha_com_o_motivo(tmp_path: Path, capsys: 
 def test_decidir_a_pasta_que_nao_existe_falha_com_o_motivo(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
     assert principal(["decidir", str(tmp_path / "nenhuma")]) == 1
     assert "antifraude-pix decidir: não consegui ler" in capsys.readouterr().err
+
+
+def test_experimentos_grava_uma_corrida_por_modelo_de_cada_variante(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    principal(["simular", "--clientes", "150", "--dias", "125", "--golpes-por-mil", "200", "--saida", str(tmp_path)])
+    capsys.readouterr()
+
+    assert principal(["experimentos", str(tmp_path)]) == 0
+    impresso = capsys.readouterr().out
+    corridas = MlflowClient(endereco(tmp_path)).search_runs(
+        [MlflowClient(endereco(tmp_path)).get_experiment_by_name(EXPERIMENTO).experiment_id]  # type: ignore[union-attr]
+    )
+
+    assert impresso.startswith("As variantes, com a precisão média de cada modelo nos meses de teste:")
+    assert all(f"- {variante.nome}: " in impresso for variante in VARIANTES)
+    assert "uv run mlflow ui --backend-store-uri sqlite:///" in impresso
+    assert len(corridas) == sum(len(variante.modelos) for variante in VARIANTES)
+
+
+def test_registrar_grava_o_campeao_e_a_ficha(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    principal(["simular", "--clientes", "150", "--dias", "125", "--golpes-por-mil", "200", "--saida", str(tmp_path)])
+    capsys.readouterr()
+
+    assert principal(["registrar", str(tmp_path), "--ficha", str(tmp_path / "docs" / "ficha.md")]) == 0
+    impresso = capsys.readouterr().out
+    campeao = MlflowClient(endereco(tmp_path)).get_model_version_by_alias(NOME, CAMPEAO)
+
+    assert "O modelo antifraude-pix, versão 1, registrado no MLflow com o apelido campeao." in impresso
+    assert (tmp_path / "docs" / "ficha.md").read_text(encoding="utf-8") == campeao.description
+
+
+def test_cartoes_baixa_confere_e_roda_o_mesmo_processo(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    origem = cartoes_inventados(tmp_path / "origem")
+    monkeypatch.setattr(base_dos_cartoes, "ENDERECO", origem.as_uri())
+    monkeypatch.setattr(base_dos_cartoes, "MD5", hashlib.md5(origem.read_bytes(), usedforsecurity=False).hexdigest())
+
+    assert principal(["cartoes", str(tmp_path / "dados")]) == 0
+    impresso = capsys.readouterr().out
+
+    assert impresso.startswith("Baixando a base de cartões da ULB do OpenML (151 MB)")
+    assert all(nome in impresso for nome in ("o valor sozinho", "a regressão logística", "o LightGBM"))
+    assert (tmp_path / "dados" / "cartoes" / base_dos_cartoes.ARQUIVO).exists()
+    cliente = MlflowClient(endereco(tmp_path / "dados"))
+    dos_cartoes = cliente.get_experiment_by_name("cartoes-ulb")
+    assert dos_cartoes is not None
+    assert len(cliente.search_runs([dos_cartoes.experiment_id])) == 3
+
+
+def test_cartoes_com_o_arquivo_que_nao_confere_falha_com_o_motivo(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(base_dos_cartoes, "ENDERECO", cartoes_inventados(tmp_path / "origem").as_uri())
+
+    assert principal(["cartoes", str(tmp_path / "dados")]) == 1
+    assert "antifraude-pix cartoes: não consegui a base de cartões" in capsys.readouterr().err
+
+
+def test_registrar_a_pasta_que_nao_existe_falha_com_o_motivo(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    assert principal(["registrar", str(tmp_path / "nenhuma")]) == 1
+    assert "antifraude-pix registrar: não consegui ler" in capsys.readouterr().err

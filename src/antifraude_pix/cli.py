@@ -4,23 +4,31 @@
 - `validar` os confere;
 - `variaveis` calcula as variáveis de cada Pix;
 - `avaliar` treina os modelos mês a mês com o rótulo do dia, e os mede contra a verdade;
-- `decidir` decide cada Pix pelo custo, explica cada decisão em português, e mede o custo e os erros por idade.
+- `decidir` decide cada Pix pelo custo, explica cada decisão em português, e mede o custo e os erros por idade;
+- `experimentos` refaz no MLflow as medidas que decidiram o desenho dos modelos;
+- `registrar` treina o modelo final e o registra no MLflow, com a ficha, como o campeão;
+- `cartoes` roda o mesmo processo na base pública de cartões da ULB.
 """
 
 import argparse
 import sys
 import time
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
 import polars as pl
+from mlflow.tracking import MlflowClient
 
 from antifraude_pix.avaliacao.decisoes import NOMES as NOMES_DAS_POLITICAS
 from antifraude_pix.avaliacao.decisoes import balanco
 from antifraude_pix.avaliacao.justica import por_idade
 from antifraude_pix.avaliacao.metricas import ALERTA, resumo
 from antifraude_pix.avaliacao.no_tempo import avaliar, com_a_verdade, treinados
+from antifraude_pix.cartoes import base as base_dos_cartoes
+from antifraude_pix.cartoes.processo import NOMES as NOMES_NOS_CARTOES
+from antifraude_pix.cartoes.processo import avaliar as avaliar_os_cartoes
+from antifraude_pix.cartoes.rastreio import rastrear as rastrear_os_cartoes
 from antifraude_pix.dados.banco import VisaoDoBanco
 from antifraude_pix.dados.gravacao import gravar, ler, ler_o_banco
 from antifraude_pix.dados.validacao import problemas
@@ -28,6 +36,9 @@ from antifraude_pix.decisao.custo import Acao, decidir
 from antifraude_pix.decisao.explicacao import explicar
 from antifraude_pix.modelos.rotulo import Dobra, dobras, primeiro_corte
 from antifraude_pix.modelos.treino import NOMES as NOMES_DOS_MODELOS
+from antifraude_pix.rastreio.experimentos import PASTA as PASTA_DO_RASTREIO
+from antifraude_pix.rastreio.experimentos import VARIANTES, rastrear
+from antifraude_pix.rastreio.registro import CAMPEAO, NOME, registrar
 from antifraude_pix.simulacao.configuracao import Configuracao
 from antifraude_pix.simulacao.golpes import NOMES, Golpe
 from antifraude_pix.simulacao.simulador import Simulacao, simular
@@ -41,20 +52,18 @@ def principal(argumentos: Sequence[str] | None = None) -> int:
     Devolve 0 quando dá certo, 1 quando os dados têm problema, e 2 com o pedido errado.
     """
     pedido = _leitor().parse_args(argumentos)
+    comandos: dict[str, Callable[[], int]] = {
+        "simular": lambda: _simular(pedido),
+        "validar": lambda: _validar(pedido.pasta),
+        "variaveis": lambda: _variaveis(pedido.pasta, pedido.saida),
+        "avaliar": lambda: _avaliar(pedido.pasta, pedido.saida),
+        "decidir": lambda: _decidir(pedido.pasta, pedido.saida),
+        "experimentos": lambda: _experimentos(pedido.pasta),
+        "registrar": lambda: _registrar(pedido.pasta, pedido.ficha),
+        "cartoes": lambda: _cartoes(pedido.pasta),
+    }
 
-    if pedido.comando == "simular":
-        return _simular(pedido)
-
-    if pedido.comando == "variaveis":
-        return _variaveis(pedido.pasta, pedido.saida)
-
-    if pedido.comando == "avaliar":
-        return _avaliar(pedido.pasta, pedido.saida)
-
-    if pedido.comando == "decidir":
-        return _decidir(pedido.pasta, pedido.saida)
-
-    return _validar(pedido.pasta)
+    return comandos[pedido.comando]()
 
 
 def _leitor() -> argparse.ArgumentParser:
@@ -117,6 +126,28 @@ def _leitor() -> argparse.ArgumentParser:
     decidir_.add_argument(
         "--saida", type=Path, help="o arquivo das decisões (padrão: decisoes.parquet, na pasta dos dados)"
     )
+
+    experimentos = comandos.add_parser(
+        "experimentos", help="refaz no MLflow as medidas que decidiram o desenho dos modelos, uma corrida por modelo"
+    )
+    experimentos.add_argument(
+        "pasta", type=Path, nargs="?", default=Path("dados"), help="a pasta dos dados (padrão: dados)"
+    )
+
+    registrar_ = comandos.add_parser(
+        "registrar", help="treina o modelo final e o registra no MLflow, com a ficha, como o campeão"
+    )
+    registrar_.add_argument(
+        "pasta", type=Path, nargs="?", default=Path("dados"), help="a pasta dos dados (padrão: dados)"
+    )
+    registrar_.add_argument(
+        "--ficha", type=Path, help="onde gravar a ficha do modelo (padrão: ficha-do-modelo.md, na pasta dos dados)"
+    )
+
+    cartoes = comandos.add_parser(
+        "cartoes", help="roda o mesmo processo na base pública de cartões da ULB, baixada do OpenML se faltar"
+    )
+    cartoes.add_argument("pasta", type=Path, nargs="?", default=Path("dados"), help="a pasta dos dados (padrão: dados)")
 
     return leitor
 
@@ -267,6 +298,132 @@ def _decidir(pasta: Path, saida: Path | None) -> int:
 
     print(_quadro_das_decisoes(decisoes, as_dobras))
     print(f"Decisões gravadas em {destino}, em {_numero(round(time.perf_counter() - comeco))} s.")
+
+    return 0
+
+
+def _experimentos(pasta: Path) -> int:
+    """Refaz cada variante no tempo e grava as corridas no MLflow, na pasta do rastreio (ADR-0013)."""
+    try:
+        simulacao = ler(pasta)
+    except (OSError, ValueError, KeyError) as erro:
+        print(f"antifraude-pix experimentos: não consegui ler {pasta}: {erro}", file=sys.stderr)
+        return 1
+
+    comeco = time.perf_counter()
+    visao = VisaoDoBanco.da(simulacao)
+    as_dobras = _as_dobras(visao)
+
+    if not as_dobras:
+        _sem_mes_de_teste("experimentos", pasta)
+        return 1
+
+    variaveis = calcular(visao)
+    print("As variantes, com a precisão média de cada modelo nos meses de teste:")
+
+    for variante in VARIANTES:
+        # A precisão média de cada modelo sai da própria corrida gravada, e não de outra avaliação.
+        corridas = [MlflowClient().get_run(id_) for id_ in rastrear(variante, simulacao, variaveis, as_dobras, pasta)]
+        precisoes = ", ".join(
+            f"{NOMES_DOS_MODELOS[corrida.data.tags['modelo']]} "
+            f"{_decimal(corrida.data.metrics['precisao_media'], casas=3)}"
+            for corrida in corridas
+        )
+        print(f"- {variante.nome}: {precisoes}")
+
+    print(
+        f"Corridas gravadas no MLflow, em {pasta / PASTA_DO_RASTREIO}, em "
+        f"{_numero(round(time.perf_counter() - comeco))} s. Para vê-las:"
+    )
+    print(f"uv run mlflow ui --backend-store-uri sqlite:///{(pasta / PASTA_DO_RASTREIO / 'mlflow.db').as_posix()}")
+
+    return 0
+
+
+def _registrar(pasta: Path, destino_da_ficha: Path | None) -> int:
+    """Mede o LightGBM no tempo, treina o final com tudo, e o registra no MLflow com a ficha (ADR-0014)."""
+    try:
+        simulacao = ler(pasta)
+    except (OSError, ValueError, KeyError) as erro:
+        print(f"antifraude-pix registrar: não consegui ler {pasta}: {erro}", file=sys.stderr)
+        return 1
+
+    comeco = time.perf_counter()
+    visao = VisaoDoBanco.da(simulacao)
+    as_dobras = _as_dobras(visao)
+
+    if not as_dobras:
+        _sem_mes_de_teste("registrar", pasta)
+        return 1
+
+    variaveis = calcular(visao)
+    pontuacoes = avaliar(simulacao, variaveis, as_dobras, modelos=("lightgbm",))
+    registrado = registrar(simulacao, variaveis, pontuacoes, pasta)
+    destino = destino_da_ficha or pasta / "ficha-do-modelo.md"
+    destino.parent.mkdir(parents=True, exist_ok=True)
+    destino.write_text(registrado.ficha, encoding="utf-8")
+
+    print(f"O modelo {NOME}, versão {registrado.versao}, registrado no MLflow com o apelido {CAMPEAO}.")
+    print(f'Para carregá-lo: mlflow.pyfunc.load_model("models:/{NOME}@{CAMPEAO}").')
+    print(f"Ficha gravada em {destino}, em {_numero(round(time.perf_counter() - comeco))} s.")
+
+    return 0
+
+
+def _cartoes(pasta: Path) -> int:
+    """Baixa a base de cartões, se faltar, e roda nela o mesmo processo do Pix (ADR-0015)."""
+    pasta_da_base = pasta / "cartoes"
+    comeco = time.perf_counter()
+
+    if not (pasta_da_base / base_dos_cartoes.ARQUIVO).exists():
+        print(f"Baixando a base de cartões da ULB do OpenML (151 MB) para {pasta_da_base}...")
+
+    try:
+        # O endereço e o MD5 vêm do módulo na hora: os testes os trocam por uma base inventada.
+        arquivo = base_dos_cartoes.baixar(pasta_da_base, base_dos_cartoes.ENDERECO, base_dos_cartoes.MD5)
+        compras = base_dos_cartoes.ler(arquivo)
+    except (OSError, ValueError) as erro:
+        print(f"antifraude-pix cartoes: não consegui a base de cartões: {erro}", file=sys.stderr)
+        return 1
+
+    pontuacoes = avaliar_os_cartoes(compras)
+    rastrear_os_cartoes(pontuacoes, pasta)
+    um_modelo = pontuacoes.filter(pl.col("modelo") == pontuacoes["modelo"][0])
+    fraudes = int(um_modelo["golpe"].is_not_null().sum())
+    linhas = [
+        f"{_numero(compras.height)} compras com cartão em dois dias, {_numero(int(compras['fraude'].sum()))} "
+        "fraudes. O treino é o primeiro dia; o teste, o segundo, com "
+        f"{_numero(um_modelo.height)} compras e {_numero(fraudes)} fraudes.",
+        f"Segurando os {_porcentagem(ALERTA, casas=1)} de compras com mais cara de fraude:",
+        "",
+        _linha(
+            ("", 24, "<"),
+            ("precisão média", 16, ">"),
+            ("fraudes pegas", 15, ">"),
+            ("dinheiro salvo", 16, ">"),
+            ("fraudes previstas", 19, ">"),
+            ("custo pelo custo", 18, ">"),
+        ),
+    ]
+    custos = balanco(pontuacoes).filter(pl.col("politica") == "custo")
+    custo = dict(zip(custos["modelo"], custos["custo"], strict=True))
+
+    for linha in resumo(pontuacoes).iter_rows(named=True):
+        linhas.append(
+            _linha(
+                (NOMES_NOS_CARTOES[linha["modelo"]], 24, "<"),
+                (_decimal(linha["precisao_media"]), 16, ">"),
+                (_porcentagem(linha["recall_no_alerta"], casas=0), 15, ">"),
+                (_porcentagem(linha["recall_em_reais"], casas=0), 16, ">"),
+                (_numero(round(linha["golpes_previstos"])), 19, ">"),
+                (f"€ {_numero(round(custo[linha['modelo']]))}", 18, ">"),
+            )
+        )
+
+    print("\n".join(linhas))
+    print(
+        f"Corridas gravadas no MLflow, no experimento dos cartões, em {_numero(round(time.perf_counter() - comeco))} s."
+    )
 
     return 0
 
