@@ -3,9 +3,9 @@
 [![CI](https://github.com/MarcusBomfim/antifraude-pix/actions/workflows/ci.yml/badge.svg)](https://github.com/MarcusBomfim/antifraude-pix/actions/workflows/ci.yml)
 [![Licença: MIT](https://img.shields.io/badge/licen%C3%A7a-MIT-blue.svg)](LICENSE)
 
-Detecção de fraude em Pix, do lado do banco de quem paga: o banco tem alguns milissegundos para decidir se cada Pix sai, segura para confirmar ou é bloqueado. O projeto começa por um simulador de transações com os golpes que acontecem no Brasil — o falso parente, a falsa central, a invasão de conta e a venda falsa — e com o rótulo que o banco tem de verdade: a contestação, que chega dias depois e nem sempre chega. Sobre esses dados vêm as variáveis calculadas sem olhar o futuro, os modelos validados no tempo com o rótulo que o banco tinha no dia, e a decisão de cada Pix pelo custo, explicada em português e medida para não errar mais com os mais velhos. Os experimentos ficam rastreados no MLflow, o modelo vai registrado com a sua ficha, e o mesmo processo roda numa base real, de cartões. Nas próximas partes, vêm o serviço que pontua em tempo real, o monitoramento e a entrega.
+Detecção de fraude em Pix, do lado do banco de quem paga: o banco tem alguns milissegundos para decidir se cada Pix sai, segura para confirmar ou é bloqueado. O projeto começa por um simulador de transações com os golpes que acontecem no Brasil — o falso parente, a falsa central, a invasão de conta e a venda falsa — e com o rótulo que o banco tem de verdade: a contestação, que chega dias depois e nem sempre chega. Sobre esses dados vêm as variáveis calculadas sem olhar o futuro, os modelos validados no tempo com o rótulo que o banco tinha no dia, e a decisão de cada Pix pelo custo, explicada em português e medida para não errar mais com os mais velhos. Os experimentos ficam rastreados no MLflow, o modelo vai registrado com a sua ficha, e o mesmo processo roda numa base real, de cartões. O serviço decide cada Pix em tempo real, numa API, com as mesmas variáveis do treino, provadas Pix a Pix, e com a latência medida. Nas próximas partes, vêm o monitoramento e a entrega.
 
-Python 3.13 · uv · NumPy · Polars · Parquet · scikit-learn · LightGBM · MLflow · matplotlib · pytest · hypothesis · ruff · mypy · GitHub Actions
+Python 3.13 · uv · NumPy · Polars · Parquet · scikit-learn · LightGBM · MLflow · FastAPI · uvicorn · matplotlib · pytest · hypothesis · ruff · mypy · GitHub Actions
 
 > Projeto independente, de estudo e portfólio. Não tem ligação com nenhum banco nem com o Banco Central. Os dados são de um simulador: não há nenhum dado real de cliente, nem nenhuma transação de verdade.
 
@@ -216,6 +216,65 @@ O processo se sustenta fora do simulador, e a ordem dos modelos é a mesma. A ba
 - **a taxa de fraude muda de um dia para o outro**, de 0,19% para 0,15%. A probabilidade calibrada no primeiro dia prevê fraude demais no segundo, e é a mudança que a Parte 7 vai vigiar;
 - **decidir pelo custo corta 57% do custo de aprovar tudo** (€ 26.889), e não 94%, como no Pix. Para a fraude de poucos euros, confirmar custaria mais que a fraude.
 
+## O serviço em tempo real
+
+O banco chama a API a cada Pix, antes de deixá-lo sair, e ela devolve a decisão, a chance de golpe e o porquê ([ADR-0017](docs/adr/0017-a-api-que-decide-cada-pix.md)). Ela ouve também o que muda o que o banco sabe: o aparelho novo, a contestação, e a resposta do cliente ao Pix segurado.
+
+| Rota | O que faz |
+|---|---|
+| `POST /pix` | decide o Pix que chegou |
+| `POST /pix/{id}/confirmacao` | o cliente confirmou, ou não, o Pix segurado |
+| `POST /aparelhos` | um aparelho entrou na conta de um cliente |
+| `POST /contestacoes` | a vítima contestou um Pix |
+| `GET /saude` | o modelo que decide, e o tamanho do estado |
+
+Um Pix de 1º de dezembro, à 1h07, que a API segurou:
+
+```json
+{
+  "id": 1981787,
+  "momento": "2025-12-01T01:07:12-03:00",
+  "cliente": 14724,
+  "aparelho": 1000000048,
+  "recebedor": 42614,
+  "recebedor_banco": "260",
+  "recebedor_pessoa": "PF",
+  "chave": "celular",
+  "iniciacao": "chave",
+  "valor": 5200,
+  "saldo_antes": 8816
+}
+```
+
+```json
+{
+  "id": 1981787,
+  "acao": "segurar",
+  "probabilidade": 0.648655638284315,
+  "explicacao": "Segurado para confirmar com o cliente, com 65% de chance de golpe: o aparelho entrou na conta há 44 minutos; o aparelho já tinha entrado na conta de 5 outros clientes; e o Pix leva 59% do saldo.",
+  "modelo": "antifraude-pix",
+  "versao": "3",
+  "milissegundos": 9.838000001764158
+}
+```
+
+Era uma invasão de conta, de madrugada, por um aparelho que já tinha passado pela conta de outros cinco clientes. Com 65% de chance de golpe, o Pix de R$ 52 é segurado, e não bloqueado: bloquear um cliente honesto custaria mais que o golpe.
+
+O que separa um modelo em produção de um modelo de estudo é a variável. No treino, as 33 variáveis saem em lote, com as janelas do Polars sobre a história inteira. No serviço, saem de um estado que o banco atualiza Pix a Pix, sem reler a história ([ADR-0016](docs/adr/0016-as-variaveis-em-tempo-real.md)). As duas contas têm de dar o mesmo número, ou o modelo decide com variáveis que nunca viu. O teste reproduz uma simulação inteira pelo estado, evento por evento, e compara as 33 variáveis de cada Pix com as do lote. São iguais até o último bit, em todos os 87.956 Pix.
+
+Na primeira versão, não eram. Seis variáveis diferiam no último bit, porque o Polars divide por uma constante multiplicando pelo inverso dela, e o estado dividia. O estado agora faz a conta do mesmo jeito, e o teste exige a igualdade, e não a proximidade.
+
+A latência foi medida com os Pix de dezembro, na ordem do tempo, e o campeão do registro decidindo ([ADR-0018](docs/adr/0018-a-latencia-medida.md)):
+
+| Em milissegundos | Mediana | p95 | p99 |
+|---|--:|--:|--:|
+| as variáveis | 0,03 | 0,05 | 0,08 |
+| a decisão | 0,15 | 0,23 | 0,41 |
+| a decisão do Pix segurado ou bloqueado | 8,25 | 9,11 | 11,55 |
+| a ida e volta pela API, num servidor de verdade | 1,21 | 1,51 | 1,77 |
+
+A primeira medida deu 10 ms por decisão: quase tudo era o custo de preparar uma tabela de uma linha, e não a conta. O caminho de um Pix só faz a conta em NumPy, e só o Pix segurado ou bloqueado, que tem razões a explicar, passa pela tabela. Os dois caminhos dão a mesma resposta, e os testes conferem.
+
 ## Roteiro
 
 O projeto é construído em partes, cada uma entregue funcionando, testada e documentada.
@@ -227,7 +286,7 @@ O projeto é construído em partes, cada uma entregue funcionando, testada e doc
 | 3 | Os modelos: as regras de hoje como ponto de partida, a regressão logística e o LightGBM; a validação no tempo, com o rótulo que o banco tinha no dia; as métricas para classe rara; a probabilidade calibrada | ✅ |
 | 4 | A decisão e o porquê: aprovar, segurar para confirmar ou bloquear, pelo custo; a explicação em português de cada decisão; o modelo que não erra mais com os mais velhos | ✅ |
 | 5 | Os experimentos rastreados no MLflow, o modelo registrado com a sua ficha, e o mesmo processo numa base pública real, de cartões | ✅ |
-| 6 | A pontuação em tempo real: a API em FastAPI, a latência medida, e o teste de que a API e o treino calculam as mesmas variáveis | |
+| 6 | A pontuação em tempo real: a API em FastAPI, a latência medida, e o teste de que a API e o treino calculam as mesmas variáveis | ✅ |
 | 7 | O monitoramento: os dados que mudam, o rótulo que chega depois, o golpe novo, e o retreino comparando o modelo atual com o candidato | |
 | 8 | Docker, entrega contínua, OpenTelemetry e o painel | |
 
@@ -292,6 +351,18 @@ O projeto é construído em partes, cada uma entregue funcionando, testada e doc
 - **A ficha do modelo**, gerada das medidas.
 - **A base de cartões da ULB**, baixada do OpenML e conferida pelo MD5, com o mesmo processo do Pix e as mesmas métricas.
 
+**Parte 6 — o serviço em tempo real**
+
+- **O estado do banco**, Pix a Pix: o que as 33 variáveis pedem, e só isso, com o que sai da janela mais longa podado.
+- **A paridade com o treino**: as mesmas variáveis do cálculo em lote, até o último bit.
+- **A API em FastAPI**, com o campeão do registro:
+  - a decisão, a chance e o porquê de cada Pix;
+  - o aparelho novo, a contestação e a confirmação do cliente;
+  - o pedido sem sentido recusado com o motivo.
+- **Só o Pix que saiu entra na história**: o aprovado na hora, o segurado quando o cliente confirma, e o bloqueado nunca.
+- **O caminho de um Pix só**, em NumPy, com a mesma resposta do caminho da tabela.
+- **A latência medida**, por dentro e por HTTP, num servidor de verdade.
+
 ## Decisões
 
 As decisões que mudam o desenho do projeto estão registradas em [`docs/adr`](docs/adr):
@@ -311,6 +382,9 @@ As decisões que mudam o desenho do projeto estão registradas em [`docs/adr`](d
 - [ADR-0013](docs/adr/0013-os-experimentos-rastreados-no-mlflow.md) — os experimentos rastreados no MLflow.
 - [ADR-0014](docs/adr/0014-o-modelo-registrado-com-a-ficha.md) — o modelo registrado, com a sua ficha.
 - [ADR-0015](docs/adr/0015-a-base-publica-de-cartoes.md) — o mesmo processo numa base real: a de cartões da ULB.
+- [ADR-0016](docs/adr/0016-as-variaveis-em-tempo-real.md) — as variáveis em tempo real, iguais às do treino.
+- [ADR-0017](docs/adr/0017-a-api-que-decide-cada-pix.md) — a API que decide cada Pix.
+- [ADR-0018](docs/adr/0018-a-latencia-medida.md) — a latência medida.
 
 ## Testes
 
@@ -397,6 +471,19 @@ As decisões que mudam o desenho do projeto estão registradas em [`docs/adr`](d
   - o primeiro dia no treino e o segundo no teste;
   - a calibração fora do ajuste;
   - as métricas e a decisão do Pix medindo os cartões.
+- **A paridade das variáveis em tempo real**:
+  - em todos os Pix da simulação média, e numa simulação de 200 dias em que o estado poda a história, as 33 variáveis do estado são iguais às do lote, até o último bit;
+  - também quando o estado começa no meio da história;
+  - nas bordas: o mesmo segundo, a ponta de cada janela, e o aparelho e a contestação no instante do Pix;
+  - o evento fora de ordem, o cliente desconhecido e o Pix antigo demais são recusados.
+- **A API**:
+  - dois dias de setembro pela API, com cada evento do banco: a probabilidade e a decisão de cada Pix são as do modelo com as variáveis do lote;
+  - o Pix segurado espera a confirmação, e sai quando o cliente confirma;
+  - o bloqueado não entra na história, e o mesmo Pix duas vezes é recusado;
+  - cada pedido sem sentido é recusado com o motivo;
+  - o campeão sai do registro, e o campeão antigo decide pelo MLflow, com a mesma resposta.
+- **A decisão de um Pix só**: a mesma do caminho da tabela, em 3.000 Pix e em valores sorteados.
+- **A latência**: por dentro e por um servidor de verdade, o serviço decide igual.
 - **A linha de comando e as figuras**: o que sai, o que é recusado, e as figuras gravadas.
 
 ## Como rodar
@@ -447,6 +534,18 @@ A decisão de cada Pix de teste pelo custo, com o LightGBM de cada mês, a expli
 
 ```bash
 uv run antifraude-pix decidir
+```
+
+A API, com o estado de toda a história dos dados e o campeão do registro (que `registrar` grava). O estado sobe em menos de meio minuto, e a documentação de cada rota fica em http://127.0.0.1:8000/docs:
+
+```bash
+uv run antifraude-pix servir
+```
+
+A latência do serviço, com 5.000 Pix do último mês por dentro e outros 5.000 pela API, em uns dois minutos:
+
+```bash
+uv run antifraude-pix latencia
 ```
 
 As medidas que decidiram o desenho dos modelos, refeitas e gravadas no MLflow, em uns cinco minutos:
@@ -534,6 +633,10 @@ src/antifraude_pix/
     registro.py         o modelo final, registrado com o apelido de campeão
     modelo_do_pix.py    o modelo registrado, como código: entram as variáveis, sai a decisão explicada
     ficha.py            a ficha do modelo, gerada das medidas
+  tempo_real/
+    estado.py           o estado do banco, Pix a Pix: as variáveis de um Pix, iguais às do treino
+    servico.py          a API em FastAPI que decide cada Pix
+    latencia.py         a latência medida, por dentro e pela API
   cartoes/
     base.py             a base de cartões da ULB: o download conferido e a leitura
     processo.py         o mesmo processo do Pix, nos cartões
@@ -546,8 +649,8 @@ src/antifraude_pix/
     retrato.py          as contas do retrato de cada golpe
     separacao.py        a força de cada variável, sozinha, contra cada golpe
     figuras.py          as figuras do README
-  cli.py                antifraude-pix simular, validar, variaveis, avaliar, decidir, experimentos, registrar e cartoes
-tests/                  o simulador, os dados, as variáveis, os modelos, a avaliação, a decisão, o rastreio, os cartões e as análises
+  cli.py                antifraude-pix simular, validar, variaveis, avaliar, decidir, experimentos, registrar, cartoes, servir e latencia
+tests/                  o simulador, os dados, as variáveis, os modelos, a avaliação, a decisão, o rastreio, os cartões, o serviço e as análises
 docs/adr/               decisões de arquitetura
 docs/ficha-do-modelo.md a ficha do modelo registrado
 docs/imagens/           as figuras do retrato, da força das variáveis, dos modelos, da decisão e dos cartões

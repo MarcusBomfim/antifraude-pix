@@ -1,9 +1,12 @@
 import hashlib
 from datetime import date
 from pathlib import Path
+from typing import Any
 
 import polars as pl
 import pytest
+import uvicorn
+from fastapi.testclient import TestClient
 from mlflow.tracking import MlflowClient
 
 from antifraude_pix.cartoes import base as base_dos_cartoes
@@ -224,3 +227,45 @@ def test_registrar_a_pasta_que_nao_existe_falha_com_o_motivo(
 ) -> None:
     assert principal(["registrar", str(tmp_path / "nenhuma")]) == 1
     assert "antifraude-pix registrar: não consegui ler" in capsys.readouterr().err
+
+
+def test_latencia_mede_por_dentro_e_pela_api(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    principal(["simular", "--clientes", "150", "--dias", "125", "--golpes-por-mil", "200", "--saida", str(tmp_path)])
+    principal(["registrar", str(tmp_path)])
+    capsys.readouterr()
+
+    assert principal(["latencia", str(tmp_path), "--pix", "40"]) == 0
+    impresso = capsys.readouterr().out
+
+    assert "Quem decide é o antifraude-pix, versão 1." in impresso
+    assert "Os Pix de 01/11/2025 em diante" in impresso
+    assert all(
+        medida in impresso for medida in ("as variáveis", "a decisão", "dentro do serviço", "a ida e volta pela API")
+    )
+
+
+def test_servir_sobe_o_estado_e_o_campeao(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    principal(["simular", "--clientes", "150", "--dias", "125", "--golpes-por-mil", "200", "--saida", str(tmp_path)])
+    principal(["registrar", str(tmp_path)])
+    capsys.readouterr()
+    servidas: list[Any] = []
+    monkeypatch.setattr(uvicorn, "run", lambda app, **opcoes: servidas.append((app, opcoes)))
+
+    assert principal(["servir", str(tmp_path), "--porta", "8123"]) == 0
+    ((app, opcoes),) = servidas
+    saude = TestClient(app).get("/saude").json()
+
+    assert "A API está em http://127.0.0.1:8123" in capsys.readouterr().out
+    assert opcoes["port"] == 8123
+    assert saude["versao"] == "1"
+    assert saude["pix_no_estado"] == pl.read_parquet(tmp_path / "banco" / "transacoes.parquet").height
+
+
+def test_servir_sem_campeao_falha_com_o_motivo(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    principal(["simular", "--clientes", "30", "--dias", "10", "--saida", str(tmp_path)])
+    capsys.readouterr()
+
+    assert principal(["servir", str(tmp_path)]) == 1
+    assert "antifraude-pix servir: não consegui subir o serviço" in capsys.readouterr().err

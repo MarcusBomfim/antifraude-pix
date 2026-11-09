@@ -7,7 +7,9 @@
 - `decidir` decide cada Pix pelo custo, explica cada decisão em português, e mede o custo e os erros por idade;
 - `experimentos` refaz no MLflow as medidas que decidiram o desenho dos modelos;
 - `registrar` treina o modelo final e o registra no MLflow, com a ficha, como o campeão;
-- `cartoes` roda o mesmo processo na base pública de cartões da ULB.
+- `cartoes` roda o mesmo processo na base pública de cartões da ULB;
+- `servir` põe de pé a API que decide cada Pix em tempo real, com o campeão do registro;
+- `latencia` mede quanto o serviço leva para decidir cada Pix, por dentro e pela API.
 """
 
 import argparse
@@ -18,6 +20,8 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 
 import polars as pl
+import uvicorn
+from mlflow.exceptions import MlflowException
 from mlflow.tracking import MlflowClient
 
 from antifraude_pix.avaliacao.decisoes import NOMES as NOMES_DAS_POLITICAS
@@ -42,6 +46,9 @@ from antifraude_pix.rastreio.registro import CAMPEAO, NOME, registrar
 from antifraude_pix.simulacao.configuracao import Configuracao
 from antifraude_pix.simulacao.golpes import NOMES, Golpe
 from antifraude_pix.simulacao.simulador import Simulacao, simular
+from antifraude_pix.tempo_real.estado import Estado
+from antifraude_pix.tempo_real.latencia import Evento, eventos, medir_pela_api, medir_por_dentro, resumir
+from antifraude_pix.tempo_real.servico import carregar_o_campeao, criar
 from antifraude_pix.variaveis.calculo import calcular
 from antifraude_pix.variaveis.catalogo import CATALOGO
 
@@ -61,6 +68,8 @@ def principal(argumentos: Sequence[str] | None = None) -> int:
         "experimentos": lambda: _experimentos(pedido.pasta),
         "registrar": lambda: _registrar(pedido.pasta, pedido.ficha),
         "cartoes": lambda: _cartoes(pedido.pasta),
+        "servir": lambda: _servir(pedido.pasta, pedido.porta),
+        "latencia": lambda: _latencia(pedido.pasta, pedido.pix),
     }
 
     return comandos[pedido.comando]()
@@ -148,6 +157,20 @@ def _leitor() -> argparse.ArgumentParser:
         "cartoes", help="roda o mesmo processo na base pública de cartões da ULB, baixada do OpenML se faltar"
     )
     cartoes.add_argument("pasta", type=Path, nargs="?", default=Path("dados"), help="a pasta dos dados (padrão: dados)")
+
+    servir = comandos.add_parser(
+        "servir", help="põe de pé a API que decide cada Pix em tempo real, com o campeão do registro do MLflow"
+    )
+    servir.add_argument("pasta", type=Path, nargs="?", default=Path("dados"), help="a pasta dos dados (padrão: dados)")
+    servir.add_argument("--porta", type=int, default=8000, help="a porta da API (padrão: %(default)s)")
+
+    latencia = comandos.add_parser(
+        "latencia", help="mede quanto o serviço leva para decidir cada Pix do último mês, por dentro e pela API"
+    )
+    latencia.add_argument(
+        "pasta", type=Path, nargs="?", default=Path("dados"), help="a pasta dos dados (padrão: dados)"
+    )
+    latencia.add_argument("--pix", type=int, default=5_000, help="quantos Pix em cada medida (padrão: %(default)s)")
 
     return leitor
 
@@ -426,6 +449,105 @@ def _cartoes(pasta: Path) -> int:
     )
 
     return 0
+
+
+def _servir(pasta: Path, porta: int) -> int:
+    """Sobe o estado com toda a história do banco, carrega o campeão e serve a API, até alguém parar (ADR-0017)."""
+    try:
+        visao = ler_o_banco(pasta)
+        decisor, versao = carregar_o_campeao(pasta)
+    except (OSError, ValueError, KeyError, TypeError, MlflowException) as erro:
+        print(f"antifraude-pix servir: não consegui subir o serviço com {pasta}: {erro}", file=sys.stderr)
+        return 1
+
+    comeco = time.perf_counter()
+    estado = Estado.da_historia(visao)
+    print(
+        f"O estado do banco subiu com {_numero(estado.pix)} Pix em {_numero(round(time.perf_counter() - comeco))} s. "
+        f"Quem decide é o {NOME}, versão {versao}."
+    )
+    print(f"A API está em http://127.0.0.1:{porta}, e a documentação, em http://127.0.0.1:{porta}/docs.")
+    uvicorn.run(criar(estado, decisor, versao), host="127.0.0.1", port=porta, log_level="warning")
+
+    return 0
+
+
+def _latencia(pasta: Path, quantos: int) -> int:
+    """Mede o serviço no último mês dos dados: `quantos` Pix por dentro, e os seguintes pela API (ADR-0018)."""
+    try:
+        visao = ler_o_banco(pasta)
+        decisor, versao = carregar_o_campeao(pasta)
+    except (OSError, ValueError, KeyError, TypeError, MlflowException) as erro:
+        print(f"antifraude-pix latencia: não consegui medir com {pasta}: {erro}", file=sys.stderr)
+        return 1
+
+    ultimo = visao.transacoes["momento"].max()
+
+    if not isinstance(ultimo, datetime):
+        print(f"antifraude-pix latencia: os dados de {pasta} não têm nenhum Pix.", file=sys.stderr)
+        return 1
+
+    inicio = ultimo.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    comeco = time.perf_counter()
+    estado = Estado.da_historia(visao.ate(inicio.replace(tzinfo=None)))
+    subida, na_subida = time.perf_counter() - comeco, estado.pix
+    do_mes = eventos(visao, inicio, ultimo + timedelta(seconds=1))
+    corte = _depois_de(do_mes, quantos)
+    por_dentro = medir_por_dentro(estado, decisor, do_mes[:corte])
+    pela_api = medir_pela_api(
+        criar(estado, decisor, versao), do_mes[corte : corte + _depois_de(do_mes[corte:], quantos)]
+    )
+    nao_aprovados = por_dentro.filter(pl.col("acao") != "aprovar")
+    medidas = {
+        "as variáveis": por_dentro["variaveis"],
+        "a decisão": por_dentro["decisao"],
+        "a decisão do Pix segurado ou bloqueado": nao_aprovados["decisao"],
+        "dentro do serviço": pela_api["servico"],
+        "a ida e volta pela API": pela_api["ida_e_volta"],
+    }
+    linhas = [
+        f"O estado do banco subiu com {_numero(na_subida)} Pix em {_numero(round(subida))} s. "
+        f"Quem decide é o {NOME}, versão {versao}.",
+        f"Os Pix de {inicio:%d/%m/%Y} em diante, na ordem do tempo, em milissegundos:",
+        "",
+        _linha(
+            ("", 40, "<"),
+            ("Pix", 8, ">"),
+            ("mediana", 10, ">"),
+            ("p95", 10, ">"),
+            ("p99", 10, ">"),
+            ("máximo", 10, ">"),
+        ),
+    ]
+
+    for linha in resumir(medidas).iter_rows(named=True):
+        linhas.append(
+            _linha(
+                (linha["medida"], 40, "<"),
+                (_numero(linha["pix"]), 8, ">"),
+                (_decimal(linha["p50"]), 10, ">"),
+                (_decimal(linha["p95"]), 10, ">"),
+                (_decimal(linha["p99"]), 10, ">"),
+                (_decimal(linha["maximo"]), 10, ">"),
+            )
+        )
+
+    print("\n".join(linhas))
+
+    return 0
+
+
+def _depois_de(os_eventos: list[Evento], quantos: int) -> int:
+    """A posição logo depois do `quantos`-ésimo Pix: os eventos até ali levam esse número de Pix."""
+    vistos = 0
+
+    for posicao, evento in enumerate(os_eventos):
+        vistos += evento.tipo == "pix"
+
+        if vistos == quantos:
+            return posicao + 1
+
+    return len(os_eventos)
 
 
 def _as_dobras(visao: VisaoDoBanco) -> tuple[Dobra, ...]:
