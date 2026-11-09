@@ -139,7 +139,8 @@ def test_o_peso_devolve_aos_legitimos_a_proporcao_que_eles_tem(janela: pl.DataFr
     sem_peso.fit(matriz_das_arvores(ajuste)[amostra], rotulo[amostra], categorical_feature=list(categoricas()))
     com_peso = treinar_arvores(ajuste, np.random.default_rng(3), ENTRADA).modelo
 
-    def tipica(modelo: lgb.LGBMClassifier) -> float:
+    def tipica(modelo: lgb.LGBMClassifier | lgb.Booster) -> float:
+        assert isinstance(modelo, lgb.LGBMClassifier)
         chance = np.asarray(modelo.predict_proba(matriz_das_arvores(ajuste)), dtype=np.float64)
         return float(np.median(chance[:, 1]))
 

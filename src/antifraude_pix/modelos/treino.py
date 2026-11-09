@@ -83,7 +83,9 @@ class Logistica:
 
 @dataclass(frozen=True, slots=True)
 class Arvores:
-    modelo: lgb.LGBMClassifier = field(repr=False)
+    """As árvores: as do treino, ou as mesmas, lidas do texto em que o LightGBM as grava (ADR-0014)."""
+
+    modelo: lgb.LGBMClassifier | lgb.Booster = field(repr=False)
     entrada: tuple[Variavel, ...] = ENTRADA
 
     def pontuar(self, variaveis: pl.DataFrame) -> npt.NDArray[np.float64]:

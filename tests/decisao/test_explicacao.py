@@ -7,7 +7,7 @@ import polars as pl
 import pytest
 
 from antifraude_pix.dados.banco import VisaoDoBanco
-from antifraude_pix.decisao.custo import Acao, decidir
+from antifraude_pix.decisao.custo import ACAO, Acao, decidir
 from antifraude_pix.decisao.explicacao import Razao, chance, contribuicoes, escolher, explicar, razoes, texto
 from antifraude_pix.modelos.preparo import ENTRADA
 from antifraude_pix.modelos.regras import REGRAS
@@ -213,3 +213,20 @@ def test_a_escolha_das_razoes_num_exemplo_a_mao() -> None:
         "valor_redondo",
         "hora",
     ]
+
+
+@pytest.mark.parametrize("nome", list(MODELOS))
+def test_o_lote_em_que_todo_pix_foi_aprovado_sai_sem_razoes(
+    nome: str, setembro: pl.DataFrame, treinados: dict[str, Calibrado]
+) -> None:
+    # O serviço decide um Pix por vez, e quase todo Pix é aprovado: não há nada a explicar.
+    modelo = treinados[nome]
+    aprovados = setembro.head(3).with_columns(
+        pl.lit(0.0001).alias("probabilidade"), pl.lit("aprovar").cast(ACAO).alias("acao")
+    )
+
+    assert contribuicoes(modelo, setembro.head(0)).height == 0
+    assert razoes(modelo, setembro.head(0)) == []
+    assert (
+        explicar(modelo, aprovados)["explicacao"].to_list() == ["Aprovado, com menos de 0,1% de chance de golpe."] * 3
+    )

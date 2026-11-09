@@ -55,9 +55,14 @@ def contribuicoes(modelo: Calibrado, variaveis: pl.DataFrame) -> pl.DataFrame:
     """
     match modelo.pontuador:
         case Arvores() as arvores:
+            nomes = [variavel.nome for variavel in arvores.entrada]
+
+            # O LightGBM recusa uma matriz sem linhas: a de um lote em que todo Pix foi aprovado.
+            if variaveis.is_empty():
+                return pl.DataFrame(schema=dict.fromkeys([*nomes, "base"], pl.Float64))
+
             matriz = matriz_das_arvores(variaveis, arvores.entrada)
             valores = np.asarray(arvores.modelo.predict(matriz, pred_contrib=True), dtype=np.float64)
-            nomes = [variavel.nome for variavel in arvores.entrada]
 
             return pl.DataFrame(valores, schema=[*nomes, "base"], orient="row")
         case Logistica() as logistica:
