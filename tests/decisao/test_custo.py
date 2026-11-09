@@ -3,7 +3,7 @@ import pytest
 from hypothesis import given
 from hypothesis import strategies as st
 
-from antifraude_pix.decisao.custo import ACAO, ACOES, Acao, Custos, acao, custos_esperados, decidir
+from antifraude_pix.decisao.custo import ACAO, ACOES, Acao, Custos, acao, acao_de, custos_esperados, decidir
 
 CUSTOS = Custos(confirmar=10.0, bloquear_um_honesto=150.0, confirmacao_para=0.7)
 
@@ -33,6 +33,8 @@ def test_no_empate_fica_a_saida_mais_branda() -> None:
     # 25% de R$ 80: aprovar custa R$ 20, e segurar, 10 + 10 = R$ 20.
     # Metade de chance em R$ 260: segurar custa 10 + 65 = R$ 75, e bloquear, R$ 75.
     assert _decisoes([0.25, 0.5], [80.0, 260.0], custos) == ["aprovar", "segurar"]
+    # O mesmo empate, num Pix só.
+    assert [acao_de(0.25, 80.0, custos), acao_de(0.5, 260.0, custos)] == [Acao.APROVAR, Acao.SEGURAR]
 
 
 def test_os_custos_esperados_sao_os_da_conta() -> None:
@@ -81,6 +83,11 @@ def test_a_saida_escolhida_custa_o_minimo(probabilidade: float, valor: float) ->
     ).row(0, named=True)
 
     assert linha[linha["acao"]] == min(linha[saida.value] for saida in ACOES)
+
+
+@given(_CHANCE, _VALOR)
+def test_a_saida_de_um_pix_so_e_a_da_tabela(probabilidade: float, valor: float) -> None:
+    assert acao_de(probabilidade, valor, CUSTOS).value == _decisoes([probabilidade], [valor])[0]
 
 
 @given(_CHANCE, _CHANCE, _VALOR)

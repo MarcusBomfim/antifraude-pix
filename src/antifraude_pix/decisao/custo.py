@@ -88,6 +88,22 @@ def acao(probabilidade: pl.Expr, valor: pl.Expr, custos: Custos) -> pl.Expr:
     return escolha.cast(ACAO)
 
 
+def acao_de(probabilidade: float, valor: float, custos: Custos) -> Acao:
+    """A saída de um Pix só, sem tabela: a mesma conta de `acao`, na mesma ordem, e o mesmo resultado (ADR-0018)."""
+    esperado = {
+        Acao.APROVAR: probabilidade * valor,
+        Acao.SEGURAR: custos.confirmar + probabilidade * valor * (1 - custos.confirmacao_para),
+        Acao.BLOQUEAR: (1 - probabilidade) * custos.bloquear_um_honesto,
+    }
+    escolha = Acao.APROVAR
+
+    for saida in (Acao.SEGURAR, Acao.BLOQUEAR):
+        if esperado[saida] < esperado[escolha]:
+            escolha = saida
+
+    return escolha
+
+
 def decidir(pontuacoes: pl.DataFrame, custos: Custos | None = None) -> pl.DataFrame:
     """As pontuações com a coluna `acao`, pela `probabilidade` e pelo `valor` (em reais) de cada Pix."""
     return pontuacoes.with_columns(acao(pl.col("probabilidade"), pl.col("valor"), custos or Custos()).alias("acao"))

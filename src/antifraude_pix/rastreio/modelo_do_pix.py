@@ -16,12 +16,13 @@ from typing import Any
 
 import lightgbm as lgb
 import mlflow
+import numpy as np
 import pandas as pd
 import polars as pl
 from mlflow.pyfunc.model import PythonModel
 
-from antifraude_pix.decisao.custo import Custos, decidir
-from antifraude_pix.decisao.explicacao import explicar
+from antifraude_pix.decisao.custo import Acao, Custos, acao_de, decidir
+from antifraude_pix.decisao.explicacao import explicar, texto
 from antifraude_pix.modelos.treino import Arvores, Calibrado
 from antifraude_pix.variaveis.catalogo import CATALOGO
 
@@ -55,23 +56,72 @@ class ModeloDoPix(PythonModel):
         """A decisão explicada de cada Pix, na ordem em que os Pix vieram."""
         del context, params
 
+        return self.decidir(da_tabela(model_input, self.tipos)).to_pandas()
+
+    def decidir(self, variaveis: pl.DataFrame) -> pl.DataFrame:
+        """A decisão explicada de cada Pix, direto do Polars: o caminho do serviço, sem passar pelo pandas.
+
+        As variáveis vêm com os nomes da entrada; as categorias podem vir em texto, e viram as do treino.
+        """
         if self.modelo is None:
             raise RuntimeError("O modelo ainda não foi carregado.")
 
-        variaveis = da_tabela(model_input, self.tipos)
-        pontuacao = self.modelo.pontuar(variaveis)
+        com_os_tipos = variaveis.select(pl.col(nome).cast(tipo) for nome, tipo in self.tipos.items())
+        pontuacao = self.modelo.pontuar(com_os_tipos)
         decididos = decidir(
-            variaveis.with_columns(
+            com_os_tipos.with_columns(
                 pl.Series("pontuacao", pontuacao), pl.Series("probabilidade", self.modelo.probabilidade_da(pontuacao))
             ),
             self.custos,
         )
 
-        return (
-            explicar(self.modelo, decididos)
-            .select("pontuacao", "probabilidade", pl.col("acao").cast(pl.String), "explicacao")
-            .to_pandas()
+        return explicar(self.modelo, decididos).select(
+            "pontuacao", "probabilidade", pl.col("acao").cast(pl.String), "explicacao"
         )
+
+    def decidir_um(self, variaveis: dict[str, Any]) -> dict[str, Any]:
+        """A decisão explicada de um Pix só: o caminho do serviço, com as contas em NumPy e em Python (ADR-0018).
+
+        Numa tabela de uma linha, o Polars gasta mais em preparar a conta do que em fazê-la. Aqui, a linha das
+        árvores sai direto das variáveis, o LightGBM pontua com um fio só, e a decisão é a mesma conta de `decidir`,
+        na mesma ordem: o resultado é o mesmo até o último bit, e um teste confere. Só o Pix segurado ou bloqueado,
+        que tem razões a explicar, passa pelo caminho da tabela.
+        """
+        if self.modelo is None:
+            raise RuntimeError("O modelo ainda não foi carregado.")
+
+        arvores = self.modelo.pontuador
+
+        if not isinstance(arvores, Arvores):
+            return dict(self.decidir(pl.DataFrame([variaveis])).row(0, named=True))
+
+        booster = arvores.modelo if isinstance(arvores.modelo, lgb.Booster) else arvores.modelo.booster_
+        linha = np.array([[self._numero(variavel.nome, variaveis[variavel.nome]) for variavel in arvores.entrada]])
+        pontuacao = np.asarray(booster.predict(linha, raw_score=True, num_threads=1), dtype=np.float64)
+        probabilidade = float(self.modelo.probabilidade_da(pontuacao)[0])
+        saida = acao_de(probabilidade, variaveis["valor"], self.custos)
+
+        if saida is not Acao.APROVAR:
+            return dict(self.decidir(pl.DataFrame([variaveis])).row(0, named=True))
+
+        return {
+            "pontuacao": float(pontuacao[0]),
+            "probabilidade": probabilidade,
+            "acao": saida.value,
+            "explicacao": texto(saida, probabilidade, ()),
+        }
+
+    def _numero(self, nome: str, valor: Any) -> float:
+        """O valor como as árvores o recebem: o vazio vira NaN, o sim ou não vira 1 ou 0, e a categoria, o código."""
+        if valor is None:
+            return float("nan")
+
+        tipo = self.tipos[nome]
+
+        if isinstance(tipo, pl.Enum):
+            return float(tipo.categories.to_list().index(valor))
+
+        return float(valor)
 
 
 def da_tabela(tabela: pd.DataFrame, tipos: dict[str, pl.DataType]) -> pl.DataFrame:
