@@ -12,6 +12,7 @@ authors = [{ name = "Marcus Bomfim" }]
 dependencies = [
   "lightgbm==4.7.0",
   "matplotlib==3.11.2",
+  "mlflow==3.17.2",
   "numpy==2.5.4",
   "polars==1.44.2",
   "scikit-learn==1.9.1",
@@ -74,8 +75,20 @@ ignore_missing_imports = true
 module = ["sklearn", "sklearn.*"]
 ignore_missing_imports = true
 
+# O pandas só aparece na fronteira com o MLflow, que recebe e devolve tabelas
+# dele; o código converte para o Polars logo na entrada.
+[[tool.mypy.overrides]]
+module = ["pandas", "pandas.*"]
+ignore_missing_imports = true
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = ["--strict-markers", "--strict-config", "-ra"]
 xfail_strict = true
-filterwarnings = ["error"]
+# Aviso é erro, menos os que o MLflow dá sobre o próprio código: um ao ser
+# importado, e um do jeito como ele usa o SQLAlchemy 2.1, no banco do rastreio.
+filterwarnings = [
+  "error",
+  "ignore:.*Any type hint is inferred as AnyType:UserWarning",
+  "ignore:The ``noload`` loader strategy is deprecated:sqlalchemy.exc.SADeprecationWarning",
+]
