@@ -57,7 +57,12 @@ def gravar(simulacao: Simulacao, pasta: Path) -> dict[str, Any]:
     manifesto = {
         "formato": FORMATO,
         "simulador": f"antifraude-pix {version('antifraude-pix')}",
-        "configuracao": {chave: _json(valor) for chave, valor in asdict(simulacao.config).items()},
+        # Sem a virada, o manifesto fica como era antes dela: a mesma simulação dá os mesmos bytes (ADR-0019).
+        "configuracao": {
+            chave: _json(valor)
+            for chave, valor in asdict(simulacao.config).items()
+            if not (chave == "virada" and valor is None)
+        },
         "tabelas": arquivos,
     }
     (pasta / MANIFESTO).write_text(json.dumps(manifesto, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
@@ -71,6 +76,10 @@ def ler(pasta: Path) -> Simulacao:
 
     configuracao = dict(manifesto["configuracao"])
     configuracao["inicio"] = date.fromisoformat(configuracao["inicio"])
+
+    # A virada entrou na Parte 7: o manifesto da simulação sem ela não a tem.
+    if configuracao.get("virada") is not None:
+        configuracao["virada"] = date.fromisoformat(configuracao["virada"])
 
     def tabela(parte: str, nome: str) -> pl.DataFrame:
         return pl.read_parquet(pasta / parte / f"{nome}.parquet")

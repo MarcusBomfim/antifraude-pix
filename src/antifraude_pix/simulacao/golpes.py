@@ -26,7 +26,7 @@ import numpy as np
 import numpy.typing as npt
 
 from antifraude_pix.simulacao.configuracao import Configuracao
-from antifraude_pix.simulacao.pix import Iniciacao, segundos
+from antifraude_pix.simulacao.pix import DIA, HORA, Iniciacao, segundos
 from antifraude_pix.simulacao.populacao import Cliente, Populacao, ataques_esperados
 from antifraude_pix.simulacao.sorteio import Etapa, sorteio
 
@@ -205,6 +205,8 @@ def passos(config: Configuracao, ataque: Ataque) -> tuple[Passo, ...]:
     match ataque.golpe:
         case Golpe.FALSO_PARENTE:
             return _falso_parente(gerador, ataque, inicio)
+        case Golpe.FALSA_CENTRAL if config.virada is not None and ataque.inicio.date() >= config.virada:
+            return _falsa_central_parcelada(gerador, ataque, inicio, fim=segundos(datetime.combine(config.fim, time())))
         case Golpe.FALSA_CENTRAL:
             return _falsa_central(gerador, ataque, inicio)
         case Golpe.INVASAO_DE_CONTA:
@@ -250,6 +252,31 @@ def _falsa_central(gerador: np.random.Generator, ataque: Ataque, inicio: int) ->
         laranja = ataque.laranjas[vez % len(ataque.laranjas)]
         resultado.append(Passo(instante, laranja, iniciacao, None, float(gerador.uniform(0.3, 0.7))))
         instante += int(gerador.integers(2, 16)) * 60
+
+    return tuple(resultado)
+
+
+def _falsa_central_parcelada(
+    gerador: np.random.Generator, ataque: Ataque, inicio: int, *, fim: int
+) -> tuple[Passo, ...]:
+    """A falsa central depois da virada: um Pix por dia, de três a seis dias, para a mesma "conta segura" (ADR-0019).
+
+    A "central" diz que a conta foi invadida e que o dinheiro tem de sair aos
+    poucos, "para o sistema não bloquear". Cada Pix leva de um quinto a um
+    terço do saldo, pela chave, perto da hora do primeiro. Sem a pressa dos
+    Pix em minutos, e com o recebedor que, do segundo Pix em diante, o cliente
+    já pagou, o golpe se parece com um pagamento combinado.
+    """
+    quantos = int(gerador.integers(3, 7))
+    resultado = []
+
+    for dia in range(quantos):
+        instante = inicio + dia * DIA + (int(gerador.integers(-2 * HORA, 2 * HORA)) if dia else 0)
+
+        if instante >= fim:
+            break
+
+        resultado.append(Passo(instante, ataque.laranjas[0], Iniciacao.CHAVE, None, float(gerador.uniform(0.2, 0.35))))
 
     return tuple(resultado)
 

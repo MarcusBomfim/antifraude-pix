@@ -51,6 +51,15 @@ class Configuracao:
     prazo_do_med: int = 80
     """Os dias que a vítima tem para pedir a devolução pelo MED, o Mecanismo Especial de Devolução do Pix."""
 
+    virada: date | None = None
+    """O dia em que a quadrilha da falsa central muda de tática, ou nenhum (ADR-0019).
+
+    Dali em diante, a "central" ensina a vítima a mandar o dinheiro aos
+    poucos: um Pix por dia, para a mesma "conta segura", sem pressa. É o golpe
+    novo que o monitoramento tem de perceber. Sem virada, a simulação é a de
+    sempre, byte a byte.
+    """
+
     def __post_init__(self) -> None:
         problemas = [
             problema
@@ -61,6 +70,9 @@ class Configuracao:
                 "A taxa de golpes não pode ser negativa." if self.golpes_por_mil_clientes_ao_mes < 0 else None,
                 "O limite noturno tem de ser positivo." if self.limite_noturno <= 0 else None,
                 "O prazo do MED tem de ser positivo." if self.prazo_do_med <= 0 else None,
+                "A virada tem de cair dentro da simulação."
+                if self.virada is not None and not self.inicio <= self.virada < self.fim
+                else None,
             )
             if problema is not None
         ]
