@@ -55,7 +55,7 @@ def resumo(pontuacoes: pl.DataFrame, alerta: float = ALERTA) -> pl.DataFrame:
         linhas.append(
             {
                 "modelo": modelo,
-                "precisao_media": _precisao_media(golpe, dele["probabilidade"]),
+                "precisao_media": precisao_media(golpe, dele["probabilidade"]),
                 "area_roc": float(roc_auc_score(golpe.to_numpy(), dele["probabilidade"].to_numpy())),
                 "recall_no_alerta": pegos.height / golpes,
                 "recall_em_reais": float(pegos["valor"].sum()) / float(dele.filter(golpe)["valor"].sum()),
@@ -82,7 +82,7 @@ def por_golpe(pontuacoes: pl.DataFrame, alerta: float = ALERTA) -> pl.DataFrame:
                 {
                     "modelo": modelo,
                     "golpe": golpe,
-                    "precisao_media": _precisao_media(contra["golpe"].is_not_null(), contra["probabilidade"]),
+                    "precisao_media": precisao_media(contra["golpe"].is_not_null(), contra["probabilidade"]),
                     "recall_no_alerta": int(do_golpe["alertado"].sum()) / do_golpe.height,
                     "golpes": do_golpe.height,
                 }
@@ -110,7 +110,8 @@ def confiabilidade(pontuacoes: pl.DataFrame, faixas: tuple[float, ...] = FAIXAS)
     )
 
 
-def _precisao_media(golpe: pl.Series, probabilidade: pl.Series) -> float:
+def precisao_media(golpe: pl.Series, probabilidade: pl.Series) -> float:
+    """A precisão média: a área sob a curva de precisão e recall, de quem é golpe (`golpe`) pela probabilidade."""
     if golpe.all() or not golpe.any():
         raise ValueError("A precisão média pede Pix de golpe e Pix legítimos.")
 

@@ -18,8 +18,12 @@ from antifraude_pix.rastreio.experimentos import endereco
 from antifraude_pix.rastreio.modelo_do_pix import SAIDA, ModeloDoPix, da_tabela
 from antifraude_pix.rastreio.registro import (
     CAMPEAO,
+    DESAFIANTE,
     NOME,
+    VEREDITO,
     Registrado,
+    carregar,
+    dar_o_veredito,
     gravar_os_artefatos,
     para_a_tabela,
     registrar,
@@ -103,6 +107,69 @@ def test_o_treino_final_vai_ate_o_ultimo_dia_dos_dados(variaveis: pl.DataFrame) 
     assert treino.corte == date(2025, 9, 29)
     assert 0 < treino.golpes_sabidos < treino.pix
     assert 0 < treino.na_calibracao < treino.pix
+
+
+def test_o_treino_no_corte_sabe_so_o_que_o_banco_sabia_nele(variaveis: pl.DataFrame) -> None:
+    _, no_fim = treinar_o_final(simulacao_media(), variaveis)
+    _, no_corte = treinar_o_final(simulacao_media(), variaveis, date(2025, 9, 1))
+
+    assert no_corte.corte == date(2025, 9, 1)
+    assert no_corte.pix < no_fim.pix
+    assert no_corte.golpes_sabidos < no_fim.golpes_sabidos
+
+
+@pytest.fixture(scope="module")
+def retreino(
+    tmp_path_factory: pytest.TempPathFactory, variaveis: pl.DataFrame, pontuacoes: pl.DataFrame
+) -> tuple[Path, Registrado, Registrado]:
+    """Um registro com o campeão treinado em 1º de setembro e o desafiante, duas semanas depois."""
+    pasta = tmp_path_factory.mktemp("retreino")
+    campeao = registrar(simulacao_media(), variaveis, pontuacoes, pasta, corte=date(2025, 9, 1))
+    desafiante = registrar(simulacao_media(), variaveis, pontuacoes, pasta, corte=date(2025, 9, 15), apelido=DESAFIANTE)
+
+    return pasta, campeao, desafiante
+
+
+def test_o_desafiante_entra_com_o_apelido_dele_sem_tirar_o_campeao(
+    retreino: tuple[Path, Registrado, Registrado],
+) -> None:
+    pasta, campeao, desafiante = retreino
+
+    assert (campeao.versao, desafiante.versao) == ("1", "2")
+    assert (carregar(pasta).versao, carregar(pasta).corte) == ("1", date(2025, 9, 1))
+    assert (carregar(pasta, DESAFIANTE).versao, carregar(pasta, DESAFIANTE).corte) == ("2", date(2025, 9, 15))
+    assert MlflowClient(endereco(pasta)).get_run(desafiante.corrida).data.tags["apelido"] == DESAFIANTE
+
+
+def test_o_carregado_pontua_como_o_treinado_no_mesmo_corte(
+    retreino: tuple[Path, Registrado, Registrado], variaveis: pl.DataFrame, setembro: pl.DataFrame
+) -> None:
+    pasta, _, _ = retreino
+    carregado = carregar(pasta, DESAFIANTE)
+    modelo, _ = treinar_o_final(simulacao_media(), variaveis, date(2025, 9, 15))
+    probabilidade = carregado.modelo.probabilidade_da(carregado.modelo.pontuar(setembro))
+
+    assert carregado.custos == Custos()
+    assert isinstance(carregado.custos, Custos)
+    assert np.allclose(probabilidade, modelo.probabilidade(setembro), rtol=0, atol=1e-12)
+
+
+def test_o_veredito_fica_na_versao_e_so_a_promocao_passa_o_apelido(
+    retreino: tuple[Path, Registrado, Registrado],
+) -> None:
+    pasta, _, _ = retreino
+    cliente = MlflowClient(endereco(pasta))
+
+    dar_o_veredito(pasta, "2", promovido=False)
+
+    assert cliente.get_model_version(NOME, "2").tags[VEREDITO] == "recusado"
+    assert carregar(pasta).versao == "1"
+
+    dar_o_veredito(pasta, "2", promovido=True)
+
+    assert cliente.get_model_version(NOME, "2").tags[VEREDITO] == "promovido"
+    assert carregar(pasta).versao == "2"
+    assert carregar(pasta, DESAFIANTE).versao == "2"
 
 
 def test_a_ficha_traz_as_medidas_da_avaliacao(registrado: Registrado, pontuacoes: pl.DataFrame) -> None:

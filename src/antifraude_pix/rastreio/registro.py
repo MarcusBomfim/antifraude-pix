@@ -1,7 +1,7 @@
 """O modelo que vai para o banco, registrado no MLflow com a sua ficha (ADR-0014).
 
-O modelo registrado é o LightGBM treinado com tudo o que o banco sabia no fim
-dos dados, com a probabilidade calibrada, a decisão pelo custo e a explicação
+O modelo registrado é o LightGBM treinado com tudo o que o banco sabia no corte,
+por padrão o fim dos dados, com a probabilidade calibrada, a decisão pelo custo e a explicação
 num pacote só (`modelo_do_pix.py`). É ele que a API da Parte 6 carrega, pelo
 nome e pelo apelido, e não por um arquivo solto.
 
@@ -12,7 +12,8 @@ O registro guarda junto:
 - a ficha do modelo, com as medidas da avaliação no tempo, como descrição da versão;
 - a assinatura: as variáveis de entrada, com o tipo e o vazio de cada uma, e as colunas de saída;
 - o código do pacote e as versões das bibliotecas, para o modelo carregar igual em outra máquina;
-- o apelido `campeao`, que a Parte 7 passa para o candidato quando ele ganhar.
+- o apelido `campeao`, ou o `desafiante` do retreino, que fica com o de
+  campeão quando ganha a comparação (ADR-0021).
 """
 
 import json
@@ -20,9 +21,10 @@ import logging
 import tempfile
 import warnings
 from dataclasses import asdict, dataclass
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from importlib.metadata import version
 from pathlib import Path
+from typing import Any
 
 import lightgbm as lgb
 import mlflow
@@ -40,7 +42,7 @@ from antifraude_pix.modelos.preparo import ENTRADA
 from antifraude_pix.modelos.rotulo import janela_de_treino
 from antifraude_pix.modelos.treino import SEMENTE, Arvores, Calibrado, separar, treinar
 from antifraude_pix.rastreio import modelo_do_pix
-from antifraude_pix.rastreio.experimentos import VARIANTES, experimento, metricas, parametros
+from antifraude_pix.rastreio.experimentos import VARIANTES, endereco, experimento, metricas, parametros
 from antifraude_pix.rastreio.ficha import Treino, ficha
 from antifraude_pix.rastreio.modelo_do_pix import ModeloDoPix
 from antifraude_pix.simulacao.simulador import Simulacao
@@ -50,6 +52,12 @@ NOME = "antifraude-pix"
 
 CAMPEAO = "campeao"
 """O apelido da versão que decide: a API carrega `models:/antifraude-pix@campeao`."""
+
+DESAFIANTE = "desafiante"
+"""O apelido da última versão treinada para disputar com o campeão (ADR-0021)."""
+
+VEREDITO = "veredito"
+"""A etiqueta da versão do desafiante com o resultado da comparação: `promovido` ou `recusado`."""
 
 BIBLIOTECAS = ("lightgbm", "mlflow", "numpy", "pandas", "polars", "pyarrow", "scikit-learn")
 """O que o modelo precisa para carregar, com a versão exata de quem o registrou."""
@@ -65,6 +73,17 @@ class Registrado:
     versao: str
     corrida: str
     ficha: str
+
+
+@dataclass(frozen=True, slots=True)
+class Carregado:
+    """Um modelo do registro, pelo apelido: a versão, o corte com que foi treinado, o modelo e os custos da decisão."""
+
+    versao: str
+    corte: date
+    modelo: Any
+    """O modelo calibrado, da cópia do código guardada com ele: pontua e dá a probabilidade, como o `Calibrado`."""
+    custos: Custos
 
 
 def para_a_tabela(variaveis: pl.DataFrame) -> pd.DataFrame:
@@ -85,15 +104,20 @@ def exemplo(variaveis: pl.DataFrame) -> pl.DataFrame:
     return pl.concat([variaveis.head(3), *vazios]).unique("id", keep="first", maintain_order=True)
 
 
-def treinar_o_final(simulacao: Simulacao, variaveis: pl.DataFrame) -> tuple[Calibrado, Treino]:
-    """O LightGBM treinado com tudo o que o banco sabia na véspera do dia seguinte ao último Pix."""
+def treinar_o_final(
+    simulacao: Simulacao, variaveis: pl.DataFrame, corte: date | None = None
+) -> tuple[Calibrado, Treino]:
+    """O LightGBM treinado com tudo o que o banco sabia no corte: por padrão, o dia seguinte ao último Pix."""
     visao = VisaoDoBanco.da(simulacao)
-    ultimo = visao.transacoes["momento"].max()
 
-    if not isinstance(ultimo, datetime):
-        raise ValueError("A simulação não tem nenhum Pix para treinar o modelo.")
+    if corte is None:
+        ultimo = visao.transacoes["momento"].max()
 
-    corte = ultimo.date() + timedelta(days=1)
+        if not isinstance(ultimo, datetime):
+            raise ValueError("A simulação não tem nenhum Pix para treinar o modelo.")
+
+        corte = ultimo.date() + timedelta(days=1)
+
     janela = janela_de_treino(visao, variaveis, corte)
     modelo = treinar("lightgbm", janela, corte)
     # O treino separa a calibração com o mesmo sorteio: a mesma semente dá os mesmos Pix.
@@ -130,15 +154,18 @@ def registrar(
     pasta_dos_dados: Path,
     *,
     custos: Custos | None = None,
+    corte: date | None = None,
+    apelido: str = CAMPEAO,
 ) -> Registrado:
-    """Treina o modelo final, grava a corrida com a ficha e registra a versão com o apelido de campeão.
+    """Treina o modelo com o que o banco sabia no corte, grava a corrida com a ficha e registra a versão com o apelido.
 
     As `pontuacoes` são as do LightGBM nos meses de teste, da avaliação no tempo: são elas que a ficha mostra.
+    Sem o corte, o modelo sabe tudo o que os dados têm; o apelido, sem outro, é o de campeão.
     """
     custos = custos or Custos()
     # O ambiente do uv não tem o pip, e o MLflow avisa que não achou a versão dele: as bibliotecas vão fixadas.
     logging.getLogger("mlflow.utils.environment").setLevel(logging.ERROR)
-    modelo, treino = treinar_o_final(simulacao, variaveis)
+    modelo, treino = treinar_o_final(simulacao, variaveis, corte)
     idades = variaveis.select("id", "idade")
     texto = ficha(simulacao.config, treino, pontuacoes, idades, custos=custos)
     entrada = para_a_tabela(exemplo(variaveis))
@@ -157,7 +184,9 @@ def registrar(
         # pandas 3 vai mudar, e lembra que inteiro não guarda vazio; aqui, nenhuma variável inteira fica vazia.
         warnings.filterwarnings("ignore", "Operation with range is deprecated", Pandas4Warning)
         warnings.filterwarnings("ignore", ".*Inferred schema contains integer column", UserWarning)
-        mlflow.set_tags({"variante": "registro", "modelo": "lightgbm", "mlflow.note.content": texto})
+        mlflow.set_tags(
+            {"variante": "registro", "modelo": "lightgbm", "apelido": apelido, "mlflow.note.content": texto}
+        )
         mlflow.log_params(
             parametros(VARIANTES[0], "lightgbm", simulacao, (), custos)
             | {
@@ -182,6 +211,27 @@ def registrar(
     registrado = mlflow.register_model(gravado.model_uri, NOME)
     cliente = MlflowClient()
     cliente.update_model_version(NOME, registrado.version, description=texto)
-    cliente.set_registered_model_alias(NOME, CAMPEAO, registrado.version)
+    cliente.set_registered_model_alias(NOME, apelido, registrado.version)
 
     return Registrado(str(registrado.version), corrida.info.run_id, texto)
+
+
+def carregar(pasta_dos_dados: Path, apelido: str = CAMPEAO) -> Carregado:
+    """O modelo com o apelido no registro do MLflow da pasta, com a versão e o corte com que foi treinado."""
+    mlflow.set_tracking_uri(endereco(pasta_dos_dados))
+    cliente = MlflowClient()
+    versao = cliente.get_model_version_by_alias(NOME, apelido)
+    corte = date.fromisoformat(cliente.get_run(str(versao.run_id)).data.params["treino.corte"])
+    por_dentro = mlflow.pyfunc.load_model(f"models:/{NOME}@{apelido}").unwrap_python_model()
+
+    return Carregado(str(versao.version), corte, por_dentro.modelo, por_dentro.custos)
+
+
+def dar_o_veredito(pasta_dos_dados: Path, versao: str, *, promovido: bool) -> None:
+    """Grava o veredito na versão do desafiante e, se ele ganhou, passa a ela o apelido de campeão."""
+    mlflow.set_tracking_uri(endereco(pasta_dos_dados))
+    cliente = MlflowClient()
+    cliente.set_model_version_tag(NOME, versao, VEREDITO, "promovido" if promovido else "recusado")
+
+    if promovido:
+        cliente.set_registered_model_alias(NOME, CAMPEAO, versao)
