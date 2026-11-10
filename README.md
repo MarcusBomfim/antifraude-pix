@@ -3,7 +3,7 @@
 [![CI](https://github.com/MarcusBomfim/antifraude-pix/actions/workflows/ci.yml/badge.svg)](https://github.com/MarcusBomfim/antifraude-pix/actions/workflows/ci.yml)
 [![Licença: MIT](https://img.shields.io/badge/licen%C3%A7a-MIT-blue.svg)](LICENSE)
 
-Detecção de fraude em Pix, do lado do banco de quem paga: o banco tem alguns milissegundos para decidir se cada Pix sai, segura para confirmar ou é bloqueado. O projeto começa por um simulador de transações com os golpes que acontecem no Brasil — o falso parente, a falsa central, a invasão de conta e a venda falsa — e com o rótulo que o banco tem de verdade: a contestação, que chega dias depois e nem sempre chega. Sobre esses dados vêm as variáveis calculadas sem olhar o futuro, os modelos validados no tempo com o rótulo que o banco tinha no dia, e a decisão de cada Pix pelo custo, explicada em português e medida para não errar mais com os mais velhos. Os experimentos ficam rastreados no MLflow, o modelo vai registrado com a sua ficha, e o mesmo processo roda numa base real, de cartões. O serviço decide cada Pix em tempo real, numa API, com as mesmas variáveis do treino, provadas Pix a Pix, e com a latência medida. Nas próximas partes, vêm o monitoramento e a entrega.
+Detecção de fraude em Pix, do lado do banco de quem paga: o banco tem alguns milissegundos para decidir se cada Pix sai, segura para confirmar ou é bloqueado. O projeto começa por um simulador de transações com os golpes que acontecem no Brasil — o falso parente, a falsa central, a invasão de conta e a venda falsa — e com o rótulo que o banco tem de verdade: a contestação, que chega dias depois e nem sempre chega. Sobre esses dados vêm as variáveis calculadas sem olhar o futuro, os modelos validados no tempo com o rótulo que o banco tinha no dia, e a decisão de cada Pix pelo custo, explicada em português e medida para não errar mais com os mais velhos. Os experimentos ficam rastreados no MLflow, o modelo vai registrado com a sua ficha, e o mesmo processo roda numa base real, de cartões. O serviço decide cada Pix em tempo real, numa API, com as mesmas variáveis do treino, provadas Pix a Pix, e com a latência medida. O monitor acompanha o modelo semana a semana, percebe pelo rótulo atrasado o golpe novo que a deriva dos dados não vê, e o retreino só troca o modelo quando o novo ganha nos mesmos Pix. Na próxima parte, vem a entrega.
 
 Python 3.13 · uv · NumPy · Polars · Parquet · scikit-learn · LightGBM · MLflow · FastAPI · uvicorn · matplotlib · pytest · hypothesis · ruff · mypy · GitHub Actions
 
@@ -275,6 +275,39 @@ A latência foi medida com os Pix de dezembro, na ordem do tempo, e o campeão d
 
 A primeira medida deu 10 ms por decisão: quase tudo era o custo de preparar uma tabela de uma linha, e não a conta. O caminho de um Pix só faz a conta em NumPy, e só o Pix segurado ou bloqueado, que tem razões a explicar, passa pela tabela. Os dois caminhos dão a mesma resposta, e os testes conferem.
 
+## O monitoramento e o retreino
+
+Do outro lado do modelo de fraude há alguém que se adapta. Para mostrar o monitor funcionando, a simulação ganhou uma virada: de 1º de novembro em diante, a falsa central para de pedir o dinheiro às pressas e passa a pedir um Pix por dia, de três a seis dias, sempre para a mesma "conta segura" ([ADR-0019](docs/adr/0019-a-virada-o-golpe-novo.md)). Sem a pressa, o golpe se parece com um pagamento combinado. O campeão treinado em 1º de novembro nunca o viu.
+
+O monitoramento de costume olha a deriva dos dados: se as variáveis de hoje se parecem com as do treino. Ele foi medido semana a semana, pelo índice de estabilidade da população, contra as quatro semanas antes do corte. E não viu nada: a probabilidade do campeão ficou estável em todas as semanas, com e sem a virada, com o índice de no máximo 0,006. Cem Pix de golpe num mês de quase 400 mil não mudam a distribuição de nada. A variável que mais mudou, nos dois cenários, foi um relógio, os dias desde o primeiro Pix ao recebedor, que só cresce desde o começo da simulação.
+
+O que vê o golpe novo é o rótulo, mesmo atrasado ([ADR-0020](docs/adr/0020-a-deriva-e-o-rotulo-que-chega-depois.md)). Nos Pix que o campeão aprovou, o monitor compara duas perdas:
+- **a esperada pelo próprio modelo**: a probabilidade vezes o valor de cada Pix, descontada a parte do rótulo que ainda não chegou;
+- **a conhecida pelo rótulo**: o valor dos aprovados que o banco já sabe contestados.
+
+A curva de chegada da contestação, medida na história do banco, diz o quanto descontar: 58% chega no primeiro dia, e 86% na primeira semana. Com o golpe de sempre, as duas perdas andam juntas. O golpe novo passa com a probabilidade baixa, e a perda conhecida sobe sem a esperada subir. Desde o corte, com o rótulo de 1º de dezembro:
+
+| | Perda esperada | Perda conhecida | Razão |
+|---|--:|--:|--:|
+| com a virada | R$ 11.688 | R$ 29.951 | **2,56** |
+| sem a virada | R$ 14.468 | R$ 7.118 | 0,49 |
+
+De 2 para cima, o alarme toca. Com a virada, ele tocou desde a primeira semana; sem ela, a razão nunca passou de 1,51, nem deixando o campeão até o fim de dezembro.
+
+![O golpe novo que a deriva não vê: o campeão pega de 47% a 90% da falsa central nova, contra 93% a 100% da de sempre; o PSI da probabilidade fica abaixo de 0,01 nos dois cenários; a razão entre a perda conhecida e a esperada fica entre 1,95 e 4 com a virada, e abaixo de 1,6 sem ela](docs/imagens/monitoramento.png)
+
+O alarme não troca o modelo sozinho. O retreino põe um desafiante, a mesma receita treinada 14 dias antes, contra o campeão, nos Pix das duas últimas semanas, que nenhum dos dois viu ([ADR-0021](docs/adr/0021-o-retreino-campeao-contra-desafiante.md)). Para ganhar, ele tem de passar a precisão média do campeão por 0,01, decidir mais barato, e não bloquear mais clientes honestos de 65 anos ou mais do que o acaso explica. No retreino de 1º de dezembro:
+
+| Com o rótulo de 1º de dezembro | Com a virada: campeão | desafiante | Sem a virada: campeão | desafiante |
+|---|--:|--:|--:|--:|
+| precisão média | 0,736 | **0,814** | **0,887** | 0,855 |
+| custo das decisões | R$ 17.626 | **R$ 10.907** | **R$ 10.166** | R$ 12.574 |
+| contestados pegos | 74 de 81 | 78 de 81 | 86 de 88 | 86 de 88 |
+| honestos de 65+ bloqueados | 4 | 6 | 5 | 8 |
+| veredito | | **promovido** | | recusado |
+
+Com a virada, o desafiante fica com o apelido de campeão no registro do MLflow, e a API passa a carregá-lo. Sem ela, ele fica registrado como desafiante, com o veredito, e o campeão continua. A verdade de dezembro, que só o simulador tem, deu razão às duas decisões. Com a virada, a troca cortou o custo do mês de R$ 72 mil para R$ 33 mil, e a falsa central pega foi de 111 para 130 de 141. Sem ela, os dois modelos empataram na precisão média, em 0,959, e o desafiante custaria R$ 1.669 a mais.
+
 ## Roteiro
 
 O projeto é construído em partes, cada uma entregue funcionando, testada e documentada.
@@ -287,7 +320,7 @@ O projeto é construído em partes, cada uma entregue funcionando, testada e doc
 | 4 | A decisão e o porquê: aprovar, segurar para confirmar ou bloquear, pelo custo; a explicação em português de cada decisão; o modelo que não erra mais com os mais velhos | ✅ |
 | 5 | Os experimentos rastreados no MLflow, o modelo registrado com a sua ficha, e o mesmo processo numa base pública real, de cartões | ✅ |
 | 6 | A pontuação em tempo real: a API em FastAPI, a latência medida, e o teste de que a API e o treino calculam as mesmas variáveis | ✅ |
-| 7 | O monitoramento: os dados que mudam, o rótulo que chega depois, o golpe novo, e o retreino comparando o modelo atual com o candidato | |
+| 7 | O monitoramento: os dados que mudam, o rótulo que chega depois, o golpe novo, e o retreino comparando o modelo atual com o candidato | ✅ |
 | 8 | Docker, entrega contínua, OpenTelemetry e o painel | |
 
 ## O que já está pronto
@@ -363,6 +396,15 @@ O projeto é construído em partes, cada uma entregue funcionando, testada e doc
 - **O caminho de um Pix só**, em NumPy, com a mesma resposta do caminho da tabela.
 - **A latência medida**, por dentro e por HTTP, num servidor de verdade.
 
+**Parte 7 — o monitoramento e o retreino**
+
+- **O golpe novo**: a virada, o dia em que a falsa central passa a pedir um Pix por dia, sem pressa, para a mesma conta. Sem ela, a simulação é a de sempre, byte a byte.
+- **A deriva**: o índice de estabilidade da população de cada variável e da probabilidade, semana a semana, contra as quatro semanas antes do corte.
+- **O rótulo que chega depois**: a curva de chegada da contestação, medida na história do banco, sem a verdade.
+- **A perda esperada contra a conhecida** nos Pix aprovados: o alarme quando o golpe passa o dobro do que o modelo espera.
+- **O retreino**: o desafiante contra o campeão, nos mesmos Pix, com o rótulo que o banco tem. Ele ganha pela precisão média, pelo custo e sem bloquear mais os mais velhos.
+- **O registro com dois apelidos**: o desafiante entra com o dele, o veredito fica na versão, e o de campeão só passa a ele quando ele ganha.
+
 ## Decisões
 
 As decisões que mudam o desenho do projeto estão registradas em [`docs/adr`](docs/adr):
@@ -385,6 +427,9 @@ As decisões que mudam o desenho do projeto estão registradas em [`docs/adr`](d
 - [ADR-0016](docs/adr/0016-as-variaveis-em-tempo-real.md) — as variáveis em tempo real, iguais às do treino.
 - [ADR-0017](docs/adr/0017-a-api-que-decide-cada-pix.md) — a API que decide cada Pix.
 - [ADR-0018](docs/adr/0018-a-latencia-medida.md) — a latência medida.
+- [ADR-0019](docs/adr/0019-a-virada-o-golpe-novo.md) — a virada: o golpe novo.
+- [ADR-0020](docs/adr/0020-a-deriva-e-o-rotulo-que-chega-depois.md) — a deriva, e o rótulo que chega depois.
+- [ADR-0021](docs/adr/0021-o-retreino-campeao-contra-desafiante.md) — o retreino: o campeão contra o desafiante.
 
 ## Testes
 
@@ -484,6 +529,28 @@ As decisões que mudam o desenho do projeto estão registradas em [`docs/adr`](d
   - o campeão sai do registro, e o campeão antigo decide pelo MLflow, com a mesma resposta.
 - **A decisão de um Pix só**: a mesma do caminho da tabela, em 3.000 Pix e em valores sorteados.
 - **A latência**: por dentro e por um servidor de verdade, o serviço decide igual.
+- **A virada**:
+  - o plano dos ataques não muda;
+  - só a falsa central da virada em diante muda de tática: um Pix por dia, para a mesma conta, pela chave;
+  - a que começa no dia da virada já é a nova, e a da véspera, não;
+  - a parcelada para no fim da simulação;
+  - a virada fora do período é recusada;
+  - com ela, os dados seguem o contrato e voltam do disco; sem ela, o manifesto fica como era.
+- **A deriva, em exemplos à mão**:
+  - a mesma distribuição dá zero;
+  - a categoria, os decis e o vazio dão o índice da conta feita à mão;
+  - a categoria nova não dá infinito;
+  - os limites de estável e de mudou.
+- **O rótulo que chega depois**, numa visão do banco feita à mão:
+  - a curva conta só os Pix que já tiveram o prazo do MED, e só as contestações que já chegaram;
+  - a perda de cada semana conta só os aprovados de antes do dia, e desconta o rótulo que ainda não chegou.
+- **O monitor**: uma linha por semana inteira, com todos os Pix dela; a deriva contra as quatro semanas antes do corte, conferida pela conta feita de fora; e a razão acumulada igual à conta.
+- **O retreino, nos Pix feitos à mão**:
+  - o desafiante que pega mais e custa menos ganha;
+  - o igual ao campeão não ganha por ser novo;
+  - o que ordena melhor mas segura os honestos custa mais;
+  - o bloqueio dos mais velhos pesa a partir do quinto honesto bloqueado só por ele, e não pesa com os mais novos.
+- **O registro com dois apelidos**: o desafiante entra sem tirar o campeão, o carregado pontua como o treinado no mesmo corte, e só a promoção passa o apelido.
 - **A linha de comando e as figuras**: o que sai, o que é recusado, e as figuras gravadas.
 
 ## Como rodar
@@ -554,6 +621,30 @@ As medidas que decidiram o desenho dos modelos, refeitas e gravadas no MLflow, e
 uv run antifraude-pix experimentos
 ```
 
+O golpe novo: a simulação padrão com a virada em 1º de novembro, gravada em `dados-virada/`:
+
+```bash
+uv run antifraude-pix simular --virada 2025-11-01 --saida dados-virada
+```
+
+O campeão que entrou no banco em 1º de novembro, com o que o banco sabia até ali, em menos de um minuto:
+
+```bash
+uv run antifraude-pix registrar dados-virada --corte 2025-11-01
+```
+
+O monitor das semanas de novembro, com o rótulo de 1º de dezembro, gravado em `dados-virada/monitoramento.parquet`:
+
+```bash
+uv run antifraude-pix monitorar dados-virada --ate 2025-12-01
+```
+
+O desafiante, treinado em 17 de novembro, contra o campeão, nos Pix das duas semanas seguintes. Se ele ganhar, fica com o apelido de campeão:
+
+```bash
+uv run antifraude-pix retreinar dados-virada --ate 2025-12-01
+```
+
 O MLflow mostra as corridas no navegador, em http://127.0.0.1:5000:
 
 ```bash
@@ -572,7 +663,7 @@ O mesmo processo na base de cartões da ULB, que o comando baixa do OpenML na pr
 uv run antifraude-pix cartoes
 ```
 
-As figuras deste README, em uns quatro minutos. A dos cartões só sai depois que a base foi baixada:
+As figuras deste README, em uns cinco minutos. A dos cartões só sai depois que a base foi baixada, e a do monitor, depois que a simulação da virada foi gravada:
 
 ```bash
 uv run python -m antifraude_pix.analise
@@ -630,13 +721,18 @@ src/antifraude_pix/
     justica.py          os erros em cada faixa de idade
   rastreio/
     experimentos.py     as variantes, e cada corrida no MLflow
-    registro.py         o modelo final, registrado com o apelido de campeão
+    registro.py         o modelo registrado com o apelido de campeão ou de desafiante, e o veredito
     modelo_do_pix.py    o modelo registrado, como código: entram as variáveis, sai a decisão explicada
     ficha.py            a ficha do modelo, gerada das medidas
   tempo_real/
     estado.py           o estado do banco, Pix a Pix: as variáveis de um Pix, iguais às do treino
     servico.py          a API em FastAPI que decide cada Pix
     latencia.py         a latência medida, por dentro e pela API
+  monitoramento/
+    deriva.py           o índice de estabilidade da população, de cada variável e da probabilidade
+    rotulo.py           a curva de chegada do rótulo, e a perda esperada contra a conhecida
+    semanas.py          o monitor, semana a semana, desde o corte do campeão
+    retreino.py         o campeão contra o desafiante, nos mesmos Pix, e o veredito
   cartoes/
     base.py             a base de cartões da ULB: o download conferido e a leitura
     processo.py         o mesmo processo do Pix, nos cartões
@@ -649,11 +745,13 @@ src/antifraude_pix/
     retrato.py          as contas do retrato de cada golpe
     separacao.py        a força de cada variável, sozinha, contra cada golpe
     figuras.py          as figuras do README
-  cli.py                antifraude-pix simular, validar, variaveis, avaliar, decidir, experimentos, registrar, cartoes, servir e latencia
-tests/                  o simulador, os dados, as variáveis, os modelos, a avaliação, a decisão, o rastreio, os cartões, o serviço e as análises
+  cli.py                antifraude-pix simular, validar, variaveis, avaliar, decidir, experimentos, registrar, cartoes, servir,
+                        latencia, monitorar e retreinar
+tests/                  o simulador, os dados, as variáveis, os modelos, a avaliação, a decisão, o rastreio, os cartões, o serviço,
+                        o monitoramento e as análises
 docs/adr/               decisões de arquitetura
 docs/ficha-do-modelo.md a ficha do modelo registrado
-docs/imagens/           as figuras do retrato, da força das variáveis, dos modelos, da decisão e dos cartões
+docs/imagens/           as figuras do retrato, da força das variáveis, dos modelos, da decisão, dos cartões e do monitor
 ```
 
 ## Licença

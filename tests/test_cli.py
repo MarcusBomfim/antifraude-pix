@@ -1,4 +1,5 @@
 import hashlib
+import json
 from datetime import date
 from pathlib import Path
 from typing import Any
@@ -11,8 +12,9 @@ from mlflow.tracking import MlflowClient
 
 from antifraude_pix.cartoes import base as base_dos_cartoes
 from antifraude_pix.cli import principal
+from antifraude_pix.monitoramento.rotulo import ALARME
 from antifraude_pix.rastreio.experimentos import EXPERIMENTO, VARIANTES, endereco
-from antifraude_pix.rastreio.registro import CAMPEAO, NOME
+from antifraude_pix.rastreio.registro import CAMPEAO, DESAFIANTE, NOME, VEREDITO
 from antifraude_pix.variaveis.catalogo import NOMES
 from tests.apoio import cartoes_inventados
 
@@ -42,6 +44,22 @@ def test_a_configuracao_invalida_e_recusada_com_o_motivo(tmp_path: Path, capsys:
     assert principal(["simular", "--clientes", "0", "--saida", str(tmp_path)]) == 2
     assert capsys.readouterr().err == "antifraude-pix simular: O número de clientes tem de ser positivo.\n"
     assert not (tmp_path / "banco").exists()
+
+
+def test_simular_com_a_virada_grava_o_dia_dela(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    pedido = ["simular", "--clientes", "30", "--dias", "10", "--virada", "2025-07-05", "--saida", str(tmp_path)]
+
+    assert principal(pedido) == 0
+    assert (
+        json.loads((tmp_path / "manifesto.json").read_text(encoding="utf-8"))["configuracao"]["virada"] == "2025-07-05"
+    )
+
+
+def test_a_virada_fora_da_simulacao_e_recusada_com_o_motivo(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    pedido = ["simular", "--clientes", "30", "--dias", "10", "--virada", "2025-07-11", "--saida", str(tmp_path)]
+
+    assert principal(pedido) == 2
+    assert capsys.readouterr().err == "antifraude-pix simular: A virada tem de cair dentro da simulação.\n"
 
 
 def test_validar_a_pasta_que_nao_existe_falha_com_o_motivo(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
@@ -269,3 +287,67 @@ def test_servir_sem_campeao_falha_com_o_motivo(tmp_path: Path, capsys: pytest.Ca
 
     assert principal(["servir", str(tmp_path)]) == 1
     assert "antifraude-pix servir: não consegui subir o serviço" in capsys.readouterr().err
+
+
+def test_monitorar_e_retreinar_acompanham_o_campeao_e_o_poem_contra_o_desafiante(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    principal(
+        [
+            "simular",
+            "--clientes",
+            "150",
+            "--dias",
+            "160",
+            "--golpes-por-mil",
+            "200",
+            "--virada",
+            "2025-11-01",
+            "--saida",
+            str(tmp_path),
+        ]
+    )
+    capsys.readouterr()
+
+    # Antes de 15 de outubro não termina nenhum mês de teste: o primeiro vai de 1º de outubro a 1º de novembro.
+    assert principal(["registrar", str(tmp_path), "--corte", "2025-10-15"]) == 1
+    assert "não chegam a um mês de teste antes de 15/10/2025" in capsys.readouterr().err
+    assert principal(["monitorar", str(tmp_path)]) == 1
+    assert "antifraude-pix monitorar: não consegui ler os dados e o campeão" in capsys.readouterr().err
+
+    assert principal(["registrar", str(tmp_path), "--corte", "2025-11-01"]) == 0
+    assert "Treinado com o que o banco sabia na meia-noite de 01/11/2025." in capsys.readouterr().out
+    assert principal(["monitorar", str(tmp_path), "--ate", "2025-11-07"]) == 1
+    assert "não há uma semana inteira de Pix para acompanhar" in capsys.readouterr().err
+
+    assert principal(["monitorar", str(tmp_path), "--ate", "2025-12-01"]) == 0
+    impresso = capsys.readouterr().out
+    semanas = pl.read_parquet(tmp_path / "monitoramento.parquet")
+
+    assert "O campeão é o antifraude-pix, versão 1, treinado com o que o banco sabia em 01/11/2025." in impresso
+    assert "Cada semana inteira de 03/11/2025 a 30/11/2025, contra as 4 semanas antes do corte" in impresso
+    assert semanas["semana"].to_list() == [
+        date(2025, 11, 3),
+        date(2025, 11, 10),
+        date(2025, 11, 17),
+        date(2025, 11, 24),
+    ]
+    assert ("Alarme: o golpe passa mais" in impresso) is (semanas["razao_acumulada"][-1] >= ALARME)
+    assert ("Dentro do esperado" in impresso) is (semanas["razao_acumulada"][-1] < ALARME)
+
+    # O desafiante de 1º de dezembro seria treinado em 17 de novembro; o de 10 de novembro, antes do campeão.
+    assert principal(["retreinar", str(tmp_path), "--ate", "2025-11-10"]) == 1
+    assert "ele não saberia nada a mais" in capsys.readouterr().err
+
+    assert principal(["retreinar", str(tmp_path), "--ate", "2025-12-01"]) == 0
+    impresso = capsys.readouterr().out
+    cliente = MlflowClient(endereco(tmp_path))
+    desafiante = cliente.get_model_version_by_alias(NOME, DESAFIANTE)
+    promovido = desafiante.tags[VEREDITO] == "promovido"
+
+    assert "O desafiante: versão 2, treinado com o que o banco sabia em 17/11/2025" in impresso
+    assert "Os dois decidiram os mesmos" in impresso
+    assert str(desafiante.version) == "2"
+    assert (str(cliente.get_model_version_by_alias(NOME, CAMPEAO).version) == "2") is promovido
+    assert ("O desafiante ganhou: a versão 2" in impresso) is promovido
+    assert ("O campeão continua, e a versão 2 fica como desafiante" in impresso) is not promovido

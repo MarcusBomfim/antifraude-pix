@@ -12,10 +12,13 @@ regressão logística é violeta, e o LightGBM, verde.
 Nas figuras da decisão, as saídas têm as cores de estado, sempre com o nome
 escrito: segurar é o amarelo de alerta, e bloquear, o vermelho. O modelo com a
 idade, que saiu, fica no cinza, ao lado do verde do LightGBM sem ela.
+
+Na figura do monitor, o cenário com a virada tem a cor da falsa central, em
+linha cheia, e o sem a virada fica no cinza, tracejado, como referência.
 """
 
 from collections.abc import Callable
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from functools import cached_property
 from pathlib import Path
 from typing import Any, Literal
@@ -40,10 +43,13 @@ from antifraude_pix.cartoes.processo import MODELOS as MODELOS_DOS_CARTOES
 from antifraude_pix.cartoes.processo import NOMES as NOMES_NOS_CARTOES
 from antifraude_pix.cartoes.processo import avaliar as avaliar_os_cartoes
 from antifraude_pix.dados.banco import VisaoDoBanco
-from antifraude_pix.decisao.custo import Custos, decidir
-from antifraude_pix.modelos.rotulo import Dobra, dobras, primeiro_corte
-from antifraude_pix.modelos.treino import MODELOS
+from antifraude_pix.decisao.custo import Acao, Custos, decidir
+from antifraude_pix.modelos.rotulo import Dobra, dobras, janela_de_teste, janela_de_treino, primeiro_corte
+from antifraude_pix.modelos.treino import MODELOS, treinar
 from antifraude_pix.modelos.treino import NOMES as NOMES_DOS_MODELOS
+from antifraude_pix.monitoramento.deriva import ESTAVEL
+from antifraude_pix.monitoramento.rotulo import ALARME
+from antifraude_pix.monitoramento.semanas import semana_a_semana
 from antifraude_pix.simulacao.golpes import GOLPES, NOMES, Golpe
 from antifraude_pix.simulacao.simulador import Simulacao
 from antifraude_pix.variaveis.calculo import calcular
@@ -769,6 +775,109 @@ def erros_por_idade(com_a_idade: pl.DataFrame, sem_a_idade: pl.DataFrame, idades
     return figura
 
 
+COM_A_VIRADA, SEM_A_VIRADA = "com a virada", "sem a virada"
+"""Os dois cenários do monitor: o golpe novo, e a simulação de sempre."""
+
+
+def monitorado(simulacao: Simulacao, corte: date) -> pl.DataFrame:
+    """O monitor do LightGBM treinado no corte, até o fim dos dados, com a parte da falsa central que ele pega.
+
+    A parte pega vem da verdade do simulador, que o banco não tem: é ela que diz se o alarme estava certo.
+    """
+    visao = VisaoDoBanco.da(simulacao)
+    variaveis = calcular(visao)
+    campeao = treinar("lightgbm", janela_de_treino(visao, variaveis, corte), corte)
+    fim = simulacao.config.fim
+    semanas = semana_a_semana(visao, variaveis, campeao, Custos(), corte=corte, ate=fim)
+    pix = janela_de_teste(visao, variaveis, Dobra(corte, fim))
+    decididos = decidir(pix.with_columns(pl.Series("probabilidade", campeao.probabilidade(pix))))
+    falsa_central = simulacao.verdade.fraudes.filter(pl.col("golpe") == Golpe.FALSA_CENTRAL.value).select(
+        pl.col("transacao").alias("id")
+    )
+    pega = (
+        decididos.join(falsa_central, on="id")
+        .group_by(pl.col("dia").dt.truncate("1w").alias("semana"))
+        .agg((pl.col("acao") != Acao.APROVAR.value).mean().alias("falsa_central_pega"))
+    )
+
+    return semanas.join(pega, on="semana", how="left")
+
+
+def monitoramento(cenarios: dict[str, pl.DataFrame]) -> Figure:
+    """O monitor nos dois cenários, semana a semana: a verdade que o banco não vê, a deriva, e o rótulo."""
+    estilos = {
+        COM_A_VIRADA: {"color": CORES[NOMES[Golpe.FALSA_CENTRAL]], "linestyle": "-"},
+        SEM_A_VIRADA: {"color": MUDO, "linestyle": "--"},
+    }
+    semanas = cenarios[COM_A_VIRADA]["semana"].to_list()
+    maior_razao = max(float(semanas_do_cenario["razao_acumulada"].max()) for semanas_do_cenario in cenarios.values())  # type: ignore[arg-type]
+    quadros_e_colunas: tuple[tuple[str, str, float, float, Callable[[float, object], str]], ...] = (
+        (
+            "falsa_central_pega",
+            "A falsa central pega pelo campeão, pela verdade do simulador, que o banco não vê",
+            1.05,
+            0.2,
+            _porcentagem,
+        ),
+        (
+            "psi_da_probabilidade",
+            "A deriva da probabilidade do campeão (PSI), contra as quatro semanas antes do corte",
+            0.3,
+            0.1,
+            lambda valor, _: f"{valor:.1f}".replace(".", ","),
+        ),
+        (
+            "razao_acumulada",
+            "A perda conhecida pelo rótulo nos Pix aprovados, sobre a esperada, desde o corte",
+            max(4.0, maior_razao * 1.15),
+            1.0,
+            lambda valor, _: "1 vez" if round(valor) == 1 else f"{valor:.0f} vezes",
+        ),
+    )
+
+    with mpl.rc_context(_ESTILO):
+        figura = _figura(9.6)
+        quadros = figura.subplots(3, 1, sharex=True)
+
+        for quadro, (coluna, titulo, teto, passo, formato) in zip(quadros, quadros_e_colunas, strict=True):
+            finais: dict[str, float] = {}
+
+            for nome, semanas_do_cenario in cenarios.items():
+                valores = semanas_do_cenario[coluna].to_list()
+                quadro.plot(
+                    range(len(valores)), valores, marker="o", markersize=6, linewidth=2, label=nome, **estilos[nome]
+                )
+                finais[nome] = valores[-1]
+
+            quadro.set_ylim(0, teto)
+            quadro.yaxis.set_major_locator(MultipleLocator(passo))
+            quadro.yaxis.set_major_formatter(FuncFormatter(formato))
+
+            # Os nomes no fim das linhas, afastados o bastante para não se tocarem quando as linhas se encostam.
+            for nome, altura in _afastados(finais, teto * 0.09).items():
+                quadro.text(len(semanas) - 0.75, altura, nome, va="center", fontsize=9, color=TINTA_SECUNDARIA)
+
+            quadro.set_title(titulo, fontsize=10)
+
+        pega, deriva, razao = quadros
+        pega.legend(frameon=False, loc="lower left", fontsize=9, ncols=2)
+        deriva.axhline(ESTAVEL, color=EIXO, linewidth=1, linestyle=":")
+        deriva.text(0, ESTAVEL + 0.012, "abaixo de 0,1, estável", fontsize=8, color=TINTA_SECUNDARIA)
+        razao.axhline(ALARME, color=BLOQUEAR, linewidth=1, linestyle=":")
+        razao.text(0, ALARME + 0.1, "de 2 vezes para cima, o alarme", fontsize=8, color=TINTA_SECUNDARIA)
+        razao.set_xticks(range(len(semanas)), [f"{semana:%d/%m}" for semana in semanas])
+        razao.set_xlim(-0.3, len(semanas) + 0.9)
+        razao.set_xlabel("A semana, de segunda a domingo")
+        _titulo(
+            figura,
+            "O golpe novo que a deriva não vê",
+            "Da virada em diante, a falsa central pede um Pix por dia. O campeão deixa passar mais, "
+            "o PSI nem se mexe, e o rótulo acusa.",
+        )
+
+    return figura
+
+
 def _misturar(cor: str, parte: float) -> str:
     """A cor misturada à superfície: a parte dela, e o resto da superfície. É o tom de fundo de uma região."""
     de = [int(cor[i : i + 2], 16) for i in (1, 3, 5)]
@@ -819,11 +928,16 @@ class Insumos:
     """O que as figuras pedem, calculado uma vez só, e só quando alguma figura pede: as variáveis e as avaliações."""
 
     def __init__(
-        self, simulacao: Simulacao, as_dobras: tuple[Dobra, ...] | None = None, cartoes: Path | None = None
+        self,
+        simulacao: Simulacao,
+        as_dobras: tuple[Dobra, ...] | None = None,
+        cartoes: Path | None = None,
+        virada: Simulacao | None = None,
     ) -> None:
         self.simulacao = simulacao
         self._dobras = as_dobras
         self.arquivo_dos_cartoes = cartoes
+        self.com_a_virada = virada
 
     @cached_property
     def nos_cartoes(self) -> pl.DataFrame:
@@ -866,6 +980,16 @@ class Insumos:
     def idades(self) -> pl.DataFrame:
         return self.variaveis.select("id", "idade")
 
+    @cached_property
+    def monitorados(self) -> dict[str, pl.DataFrame]:
+        """O monitor nos dois cenários, com o campeão treinado no dia da virada: a figura sai só com ela."""
+        if self.com_a_virada is None or self.com_a_virada.config.virada is None:
+            raise ValueError("A figura do monitor pede a simulação com a virada.")
+
+        corte = self.com_a_virada.config.virada
+
+        return {COM_A_VIRADA: monitorado(self.com_a_virada, corte), SEM_A_VIRADA: monitorado(self.simulacao, corte)}
+
 
 FIGURAS: dict[str, Callable[[Insumos], Figure]] = {
     "horas": lambda insumos: horas(insumos.simulacao),
@@ -888,18 +1012,32 @@ FIGURAS_DOS_CARTOES: dict[str, Callable[[Insumos], Figure]] = {
 }
 """As figuras da base de cartões: só com o arquivo dela, que fica fora do repositório."""
 
+FIGURAS_DA_VIRADA: dict[str, Callable[[Insumos], Figure]] = {
+    "monitoramento": lambda insumos: monitoramento(insumos.monitorados),
+}
+"""A figura do monitor: só com a simulação da virada, que `antifraude-pix simular --virada` grava."""
+
 
 def gerar(
-    simulacao: Simulacao, pasta: Path, as_dobras: tuple[Dobra, ...] | None = None, cartoes: Path | None = None
+    simulacao: Simulacao,
+    pasta: Path,
+    as_dobras: tuple[Dobra, ...] | None = None,
+    cartoes: Path | None = None,
+    virada: Simulacao | None = None,
 ) -> list[Path]:
     """Desenha as figuras e as grava em PNG na pasta.
 
-    As dobras da avaliação são as do padrão, se não vierem. A figura dos cartões só sai com o arquivo da base.
+    As dobras da avaliação são as do padrão, se não vierem. A figura dos cartões só sai com o arquivo da base, e a
+    do monitor, com a simulação da virada.
     """
     pasta.mkdir(parents=True, exist_ok=True)
-    insumos = Insumos(simulacao, as_dobras, cartoes)
+    insumos = Insumos(simulacao, as_dobras, cartoes, virada)
     gravadas = []
-    todas = FIGURAS | (FIGURAS_DOS_CARTOES if cartoes is not None else {})
+    todas = (
+        FIGURAS
+        | (FIGURAS_DOS_CARTOES if cartoes is not None else {})
+        | (FIGURAS_DA_VIRADA if virada is not None else {})
+    )
 
     for nome, desenhar in todas.items():
         destino = pasta / f"{nome}.png"

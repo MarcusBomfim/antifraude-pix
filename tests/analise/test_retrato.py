@@ -1,3 +1,4 @@
+from dataclasses import replace
 from datetime import date
 from pathlib import Path
 
@@ -7,8 +8,8 @@ import pytest
 from antifraude_pix.analise import figuras, retrato
 from antifraude_pix.modelos.rotulo import Dobra
 from antifraude_pix.simulacao.golpes import GOLPES
-from antifraude_pix.simulacao.simulador import Simulacao
-from tests.apoio import cartoes_inventados
+from antifraude_pix.simulacao.simulador import Simulacao, simular
+from tests.apoio import MEDIA, cartoes_inventados
 
 
 def test_cada_grupo_tem_as_24_horas_e_elas_somam_tudo(simulacao: Simulacao) -> None:
@@ -71,9 +72,11 @@ def test_os_rotulos_proximos_se_afastam_sem_mudar_de_ordem() -> None:
 
 
 def test_as_figuras_sao_gravadas_em_png(simulacao: Simulacao, tmp_path: Path) -> None:
-    # A simulação média termina em setembro: o teste dos modelos é setembro, sem o mês de validação.
+    # A simulação média termina em setembro: o teste dos modelos é setembro, sem o mês de validação, e o monitor
+    # acompanha as quatro semanas de setembro, com a virada no primeiro dia dele.
     cartoes = cartoes_inventados(tmp_path / "cartoes")
-    gravadas = figuras.gerar(simulacao, tmp_path, (Dobra(date(2025, 9, 1), date(2025, 9, 29)),), cartoes)
+    virada = simular(replace(MEDIA, virada=date(2025, 9, 1)))
+    gravadas = figuras.gerar(simulacao, tmp_path, (Dobra(date(2025, 9, 1), date(2025, 9, 29)),), cartoes, virada)
 
     assert [figura.name for figura in gravadas] == [
         "horas.png",
@@ -89,5 +92,15 @@ def test_as_figuras_sao_gravadas_em_png(simulacao: Simulacao, tmp_path: Path) ->
         "custo_das_politicas.png",
         "erros_por_idade.png",
         "fraudes_nos_cartoes.png",
+        "monitoramento.png",
     ]
     assert all(figura.read_bytes().startswith(b"\x89PNG") for figura in gravadas)
+
+
+def test_o_monitor_da_figura_tem_a_falsa_central_pega_em_cada_semana(simulacao: Simulacao) -> None:
+    semanas = figuras.monitorado(simulacao, date(2025, 9, 1))
+
+    assert semanas["semana"].to_list() == [date(2025, 9, dia) for dia in (1, 8, 15, 22)]
+    assert semanas["falsa_central_pega"].is_between(0, 1).all()
+    # Sem a virada, a falsa central é a de sempre, e o campeão pega a maior parte dela.
+    assert semanas["falsa_central_pega"].mean() > 0.5  # type: ignore[operator]

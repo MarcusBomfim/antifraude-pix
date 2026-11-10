@@ -1,15 +1,17 @@
 """A linha de comando do projeto.
 
-- `simular` gera os dados;
+- `simular` gera os dados, com ou sem a virada da falsa central;
 - `validar` os confere;
 - `variaveis` calcula as variáveis de cada Pix;
 - `avaliar` treina os modelos mês a mês com o rótulo do dia, e os mede contra a verdade;
 - `decidir` decide cada Pix pelo custo, explica cada decisão em português, e mede o custo e os erros por idade;
 - `experimentos` refaz no MLflow as medidas que decidiram o desenho dos modelos;
-- `registrar` treina o modelo final e o registra no MLflow, com a ficha, como o campeão;
+- `registrar` treina o modelo final, ou o de um corte, e o registra no MLflow, com a ficha, como o campeão;
 - `cartoes` roda o mesmo processo na base pública de cartões da ULB;
 - `servir` põe de pé a API que decide cada Pix em tempo real, com o campeão do registro;
-- `latencia` mede quanto o serviço leva para decidir cada Pix, por dentro e pela API.
+- `latencia` mede quanto o serviço leva para decidir cada Pix, por dentro e pela API;
+- `monitorar` acompanha o campeão semana a semana: a deriva, as saídas e a perda que o rótulo mostra;
+- `retreinar` treina um desafiante, o compara com o campeão nos mesmos Pix, e o promove se ele ganhar.
 """
 
 import argparse
@@ -38,11 +40,15 @@ from antifraude_pix.dados.gravacao import gravar, ler, ler_o_banco
 from antifraude_pix.dados.validacao import problemas
 from antifraude_pix.decisao.custo import Acao, decidir
 from antifraude_pix.decisao.explicacao import explicar
-from antifraude_pix.modelos.rotulo import Dobra, dobras, primeiro_corte
+from antifraude_pix.modelos.rotulo import Dobra, dobras, janela_de_teste, primeiro_corte
 from antifraude_pix.modelos.treino import NOMES as NOMES_DOS_MODELOS
+from antifraude_pix.monitoramento.deriva import MUDOU, nivel
+from antifraude_pix.monitoramento.retreino import JANELA, Veredito, comparar
+from antifraude_pix.monitoramento.rotulo import ALARME, conhecidos
+from antifraude_pix.monitoramento.semanas import REFERENCIA, semana_a_semana
 from antifraude_pix.rastreio.experimentos import PASTA as PASTA_DO_RASTREIO
 from antifraude_pix.rastreio.experimentos import VARIANTES, rastrear
-from antifraude_pix.rastreio.registro import CAMPEAO, NOME, registrar
+from antifraude_pix.rastreio.registro import CAMPEAO, DESAFIANTE, NOME, Carregado, carregar, dar_o_veredito, registrar
 from antifraude_pix.simulacao.configuracao import Configuracao
 from antifraude_pix.simulacao.golpes import NOMES, Golpe
 from antifraude_pix.simulacao.simulador import Simulacao, simular
@@ -66,10 +72,12 @@ def principal(argumentos: Sequence[str] | None = None) -> int:
         "avaliar": lambda: _avaliar(pedido.pasta, pedido.saida),
         "decidir": lambda: _decidir(pedido.pasta, pedido.saida),
         "experimentos": lambda: _experimentos(pedido.pasta),
-        "registrar": lambda: _registrar(pedido.pasta, pedido.ficha),
+        "registrar": lambda: _registrar(pedido.pasta, pedido.ficha, pedido.corte),
         "cartoes": lambda: _cartoes(pedido.pasta),
         "servir": lambda: _servir(pedido.pasta, pedido.porta),
         "latencia": lambda: _latencia(pedido.pasta, pedido.pix),
+        "monitorar": lambda: _monitorar(pedido.pasta, pedido.ate, pedido.saida),
+        "retreinar": lambda: _retreinar(pedido.pasta, pedido.ate),
     }
 
     return comandos[pedido.comando]()
@@ -99,6 +107,11 @@ def _leitor() -> argparse.ArgumentParser:
         type=float,
         default=padrao.golpes_por_mil_clientes_ao_mes,
         help="ataques por mês a cada mil clientes (padrão: %(default)s)",
+    )
+    simular_.add_argument(
+        "--virada",
+        type=date.fromisoformat,
+        help="o dia em que a falsa central passa a pedir um Pix por dia, AAAA-MM-DD (padrão: sem virada)",
     )
     simular_.add_argument("--saida", type=Path, default=Path("dados"), help="a pasta dos dados (padrão: %(default)s)")
 
@@ -152,6 +165,11 @@ def _leitor() -> argparse.ArgumentParser:
     registrar_.add_argument(
         "--ficha", type=Path, help="onde gravar a ficha do modelo (padrão: ficha-do-modelo.md, na pasta dos dados)"
     )
+    registrar_.add_argument(
+        "--corte",
+        type=date.fromisoformat,
+        help="treina com o que o banco sabia na meia-noite deste dia, AAAA-MM-DD (padrão: tudo o que os dados têm)",
+    )
 
     cartoes = comandos.add_parser(
         "cartoes", help="roda o mesmo processo na base pública de cartões da ULB, baixada do OpenML se faltar"
@@ -172,6 +190,26 @@ def _leitor() -> argparse.ArgumentParser:
     )
     latencia.add_argument("--pix", type=int, default=5_000, help="quantos Pix em cada medida (padrão: %(default)s)")
 
+    ajuda_do_ate = "o dia de hoje, AAAA-MM-DD: vale o que o banco sabia na meia-noite dele (padrão: o fim dos dados)"
+    monitorar = comandos.add_parser(
+        "monitorar", help="acompanha o campeão semana a semana: a deriva, as saídas e a perda que o rótulo mostra"
+    )
+    monitorar.add_argument(
+        "pasta", type=Path, nargs="?", default=Path("dados"), help="a pasta dos dados (padrão: dados)"
+    )
+    monitorar.add_argument("--ate", type=date.fromisoformat, help=ajuda_do_ate)
+    monitorar.add_argument(
+        "--saida", type=Path, help="o arquivo das semanas (padrão: monitoramento.parquet, na pasta dos dados)"
+    )
+
+    retreinar = comandos.add_parser(
+        "retreinar", help="treina um desafiante, o compara com o campeão nos mesmos Pix e o promove se ele ganhar"
+    )
+    retreinar.add_argument(
+        "pasta", type=Path, nargs="?", default=Path("dados"), help="a pasta dos dados (padrão: dados)"
+    )
+    retreinar.add_argument("--ate", type=date.fromisoformat, help=ajuda_do_ate)
+
     return leitor
 
 
@@ -183,6 +221,7 @@ def _simular(pedido: argparse.Namespace) -> int:
             inicio=pedido.inicio,
             semente=pedido.semente,
             golpes_por_mil_clientes_ao_mes=pedido.golpes_por_mil,
+            virada=pedido.virada,
         )
     except ValueError as erro:
         print(f"antifraude-pix simular: {erro}", file=sys.stderr)
@@ -363,8 +402,11 @@ def _experimentos(pasta: Path) -> int:
     return 0
 
 
-def _registrar(pasta: Path, destino_da_ficha: Path | None) -> int:
-    """Mede o LightGBM no tempo, treina o final com tudo, e o registra no MLflow com a ficha (ADR-0014)."""
+def _registrar(pasta: Path, destino_da_ficha: Path | None, corte: date | None) -> int:
+    """Mede o LightGBM no tempo, treina o final com o que o banco sabia no corte, e o registra com a ficha (ADR-0014).
+
+    Com o corte, a ficha mostra só os meses de teste que terminam até ele: o modelo não sabe do que vem depois.
+    """
     try:
         simulacao = ler(pasta)
     except (OSError, ValueError, KeyError) as erro:
@@ -373,20 +415,24 @@ def _registrar(pasta: Path, destino_da_ficha: Path | None) -> int:
 
     comeco = time.perf_counter()
     visao = VisaoDoBanco.da(simulacao)
-    as_dobras = _as_dobras(visao)
+    as_dobras = _ate_o_corte(_as_dobras(visao), corte)
 
     if not as_dobras:
-        _sem_mes_de_teste("registrar", pasta)
+        _sem_mes_de_teste("registrar", pasta, corte)
         return 1
 
     variaveis = calcular(visao)
     pontuacoes = avaliar(simulacao, variaveis, as_dobras, modelos=("lightgbm",))
-    registrado = registrar(simulacao, variaveis, pontuacoes, pasta)
+    registrado = registrar(simulacao, variaveis, pontuacoes, pasta, corte=corte)
     destino = destino_da_ficha or pasta / "ficha-do-modelo.md"
     destino.parent.mkdir(parents=True, exist_ok=True)
     destino.write_text(registrado.ficha, encoding="utf-8")
 
     print(f"O modelo {NOME}, versão {registrado.versao}, registrado no MLflow com o apelido {CAMPEAO}.")
+
+    if corte is not None:
+        print(f"Treinado com o que o banco sabia na meia-noite de {corte:%d/%m/%Y}.")
+
     print(f'Para carregá-lo: mlflow.pyfunc.load_model("models:/{NOME}@{CAMPEAO}").')
     print(f"Ficha gravada em {destino}, em {_numero(round(time.perf_counter() - comeco))} s.")
 
@@ -556,12 +602,221 @@ def _as_dobras(visao: VisaoDoBanco) -> tuple[Dobra, ...]:
     return dobras(primeiro_corte(visao), ultimo.date()) if isinstance(ultimo, datetime) else ()
 
 
-def _sem_mes_de_teste(comando: str, pasta: Path) -> None:
+def _ate_o_corte(as_dobras: tuple[Dobra, ...], corte: date | None) -> tuple[Dobra, ...]:
+    """Os meses de teste que terminam até o corte: os que o modelo treinado nele poderia ter visto medidos."""
+    return as_dobras if corte is None else tuple(dobra for dobra in as_dobras if dobra.fim <= corte)
+
+
+def _o_fim(visao: VisaoDoBanco) -> date:
+    """O dia seguinte ao último Pix: o monitor e o retreino olham, por padrão, tudo o que os dados têm."""
+    ultimo = visao.transacoes["momento"].max()
+
+    if not isinstance(ultimo, datetime):
+        raise ValueError("Os dados não têm nenhum Pix.")
+
+    return ultimo.date() + timedelta(days=1)
+
+
+def _sem_mes_de_teste(comando: str, pasta: Path, corte: date | None = None) -> None:
+    ate = "" if corte is None else f" antes de {corte:%d/%m/%Y}"
     print(
-        f"antifraude-pix {comando}: os dados de {pasta} não chegam a um mês de teste. Antes dele, são precisos "
-        "o aquecimento, um mês de treino e um mês de validação.",
+        f"antifraude-pix {comando}: os dados de {pasta} não chegam a um mês de teste{ate}. Antes dele, são "
+        "precisos o aquecimento, um mês de treino e um mês de validação.",
         file=sys.stderr,
     )
+
+
+def _monitorar(pasta: Path, ate: date | None, destino: Path | None) -> int:
+    """Acompanha o campeão desde o corte dele, semana a semana, com o que o banco sabia em `ate` (ADR-0020)."""
+    try:
+        simulacao = ler(pasta)
+        campeao = carregar(pasta)
+    except (OSError, ValueError, KeyError, MlflowException) as erro:
+        print(f"antifraude-pix monitorar: não consegui ler os dados e o campeão de {pasta}: {erro}", file=sys.stderr)
+        return 1
+
+    comeco = time.perf_counter()
+    visao = VisaoDoBanco.da(simulacao)
+    ate = ate or _o_fim(visao)
+
+    try:
+        semanas = semana_a_semana(visao, calcular(visao), campeao.modelo, campeao.custos, corte=campeao.corte, ate=ate)
+    except ValueError as erro:
+        print(f"antifraude-pix monitorar: {erro}", file=sys.stderr)
+        return 1
+
+    destino = destino or pasta / "monitoramento.parquet"
+    destino.parent.mkdir(parents=True, exist_ok=True)
+    semanas.write_parquet(destino)
+    print(_quadro_do_monitor(semanas, campeao, ate))
+    print("")
+
+    if semanas["razao_acumulada"][-1] >= ALARME:
+        print(
+            "Alarme: o golpe passa mais do que o campeão espera, e o rótulo mostra o que a deriva não mostra. "
+            f"Hora de treinar um desafiante: antifraude-pix retreinar {pasta} --ate {ate:%Y-%m-%d}."
+        )
+    else:
+        print(f"Dentro do esperado: abaixo de {_decimal(ALARME, casas=0)} vezes, o golpe passa como o campeão espera.")
+
+    print(f"Semanas gravadas em {destino}, em {_numero(round(time.perf_counter() - comeco))} s.")
+
+    return 0
+
+
+def _quadro_do_monitor(semanas: pl.DataFrame, campeao: Carregado, ate: date) -> str:
+    """O monitor em texto: uma linha por semana, e o que ele diz no fim."""
+    primeira, ultima = semanas["semana"][0], semanas["semana"][-1] + timedelta(days=6)
+    larguras = (
+        ("semana", 12, "<"),
+        ("Pix", 9, ">"),
+        ("segurados", 11, ">"),
+        ("bloqueados", 12, ">"),
+        ("PSI prob.", 11, ">"),
+        ("perda esperada", 16, ">"),
+        ("perda conhecida", 17, ">"),
+        ("razão", 8, ">"),
+    )
+    linhas = [
+        f"O campeão é o {NOME}, versão {campeao.versao}, treinado com o que o banco sabia em {campeao.corte:%d/%m/%Y}.",
+        f"Cada semana inteira de {primeira:%d/%m/%Y} a {ultima:%d/%m/%Y}, contra as {REFERENCIA // 7} semanas antes "
+        f"do corte, com o rótulo que o banco tinha em {ate:%d/%m/%Y}:",
+        "",
+        _linha(*larguras) + "  variável que mais mudou (PSI)",
+    ]
+
+    for linha in semanas.iter_rows(named=True):
+        colunas = (
+            (f"{linha['semana']:%d/%m/%Y}", 12, "<"),
+            (_numero(linha["pix"]), 9, ">"),
+            (_porcentagem(linha["parte_segurada"]), 11, ">"),
+            (_porcentagem(linha["parte_bloqueada"]), 12, ">"),
+            (_decimal(linha["psi_da_probabilidade"], casas=3), 11, ">"),
+            (_reais(linha["esperada"]), 16, ">"),
+            (_reais(linha["conhecida"]), 17, ">"),
+            ("—" if linha["razao"] is None else _decimal(linha["razao"]), 8, ">"),
+        )
+        linhas.append(f"{_linha(*colunas)}  {linha['variavel_que_mais_mudou']} ({_decimal(linha['psi_dela'])})")
+
+    maior = float(semanas["psi_da_probabilidade"].max())  # type: ignore[arg-type]
+    mudaram = semanas.filter(pl.col("psi_dela") >= MUDOU)["variavel_que_mais_mudou"].unique(maintain_order=True)
+    linhas += [
+        "",
+        f"A probabilidade do campeão: {nivel(maior)} em todas as semanas, com o PSI de no máximo "
+        f"{_decimal(maior, casas=3)}."
+        if nivel(maior) == "estável"
+        else f"A probabilidade do campeão mudou: o PSI chegou a {_decimal(maior, casas=3)}.",
+    ]
+
+    if mudaram.len():
+        linhas.append(
+            f"As variáveis que mudaram, com o PSI acima de {_decimal(MUDOU)}: {', '.join(mudaram.to_list())}."
+        )
+
+    linhas.append(
+        f"Desde o corte, a perda conhecida nos Pix aprovados é {_decimal(semanas['razao_acumulada'][-1])} "
+        "vezes a que o campeão esperava."
+    )
+
+    return "\n".join(linhas)
+
+
+def _retreinar(pasta: Path, ate: date | None) -> int:
+    """Treina o desafiante, o compara com o campeão nos mesmos Pix, e passa a ele o apelido se ele ganhar (ADR-0021)."""
+    try:
+        simulacao = ler(pasta)
+        campeao = carregar(pasta)
+    except (OSError, ValueError, KeyError, MlflowException) as erro:
+        print(f"antifraude-pix retreinar: não consegui ler os dados e o campeão de {pasta}: {erro}", file=sys.stderr)
+        return 1
+
+    comeco = time.perf_counter()
+    visao = VisaoDoBanco.da(simulacao)
+    ate = ate or _o_fim(visao)
+    corte = ate - timedelta(days=JANELA)
+
+    if corte <= campeao.corte:
+        print(
+            f"antifraude-pix retreinar: o campeão foi treinado em {campeao.corte:%d/%m/%Y}, e o desafiante seria "
+            f"treinado em {corte:%d/%m/%Y}, {JANELA} dias antes de {ate:%d/%m/%Y}: ele não saberia nada a mais.",
+            file=sys.stderr,
+        )
+        return 1
+
+    as_dobras = _ate_o_corte(_as_dobras(visao), corte)
+
+    if not as_dobras:
+        _sem_mes_de_teste("retreinar", pasta, corte)
+        return 1
+
+    variaveis = calcular(visao)
+    pontuacoes = avaliar(simulacao, variaveis, as_dobras, modelos=("lightgbm",))
+    registrar(simulacao, variaveis, pontuacoes, pasta, corte=corte, apelido=DESAFIANTE)
+    desafiante = carregar(pasta, DESAFIANTE)
+    pix = janela_de_teste(visao, variaveis, Dobra(corte, ate))
+    rotulo = conhecidos(visao, ate)
+
+    def pontuacoes_de(modelo: Carregado) -> pl.DataFrame:
+        probabilidade = modelo.modelo.probabilidade_da(modelo.modelo.pontuar(pix))
+
+        return pix.select("id", "valor", pl.Series("probabilidade", probabilidade)).join(rotulo, on="id", how="left")
+
+    try:
+        veredito = comparar(
+            pontuacoes_de(campeao), pontuacoes_de(desafiante), variaveis.select("id", "idade"), campeao.custos
+        )
+    except ValueError as erro:
+        print(f"antifraude-pix retreinar: {erro}", file=sys.stderr)
+        return 1
+
+    dar_o_veredito(pasta, desafiante.versao, promovido=veredito.promover)
+    print(_quadro_do_retreino(veredito, campeao, desafiante, pix.height, ate))
+    print(f"Em {_numero(round(time.perf_counter() - comeco))} s.")
+
+    return 0
+
+
+def _quadro_do_retreino(veredito: Veredito, campeao: Carregado, desafiante: Carregado, pix: int, ate: date) -> str:
+    """A comparação em texto: as medidas lado a lado, e o veredito."""
+    um, outro = veredito.campeao, veredito.desafiante
+    linhas = [
+        f"O campeão: {NOME}, versão {campeao.versao}, treinado com o que o banco sabia em {campeao.corte:%d/%m/%Y}.",
+        f"O desafiante: versão {desafiante.versao}, treinado com o que o banco sabia em "
+        f"{desafiante.corte:%d/%m/%Y}, registrado com o apelido {DESAFIANTE}.",
+        f"Os dois decidiram os mesmos {_numero(pix)} Pix, de {desafiante.corte:%d/%m/%Y} a "
+        f"{ate - timedelta(days=1):%d/%m/%Y}, medidos com o rótulo que o banco tinha em {ate:%d/%m/%Y}: "
+        f"{_numero(um.golpes)} contestados.",
+        "",
+        _linha(("", 30, "<"), ("campeão", 14, ">"), ("desafiante", 14, ">")),
+    ]
+
+    for nome, deste, daquele in (
+        ("precisão média", _decimal(um.precisao_media, casas=3), _decimal(outro.precisao_media, casas=3)),
+        ("custo das decisões", _reais(um.custo), _reais(outro.custo)),
+        (
+            "contestados pegos",
+            f"{_numero(um.golpes_pegos)} de {_numero(um.golpes)}",
+            f"{_numero(outro.golpes_pegos)} de {_numero(outro.golpes)}",
+        ),
+        (
+            "honestos de 65+ bloqueados",
+            _numero(um.idosos_honestos_bloqueados),
+            _numero(outro.idosos_honestos_bloqueados),
+        ),
+    ):
+        linhas.append(_linha((nome, 30, "<"), (deste, 14, ">"), (daquele, 14, ">")))
+
+    linhas.append("")
+
+    if veredito.promover:
+        linhas.append(
+            f"O desafiante ganhou: a versão {desafiante.versao} é o novo {CAMPEAO}, e a API passa a carregá-la."
+        )
+    else:
+        linhas.append(f"O campeão continua, e a versão {desafiante.versao} fica como {DESAFIANTE}. Ela não passou:")
+        linhas.extend(f"- {razao};" if razao != veredito.razoes[-1] else f"- {razao}." for razao in veredito.razoes)
+
+    return "\n".join(linhas)
 
 
 def _quadro_das_decisoes(decisoes: pl.DataFrame, as_dobras: tuple[Dobra, ...]) -> str:
