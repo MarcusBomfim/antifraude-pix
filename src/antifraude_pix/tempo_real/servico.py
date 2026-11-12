@@ -15,6 +15,9 @@ as variáveis do serviço são as do treino (ADR-0016).
 
 O estado não é feito para dois Pix ao mesmo tempo: um cadeado põe os pedidos
 em fila. A conta de cada um leva milissegundos (ADR-0018).
+
+Cada pedido deixa um traço e conta nas métricas do OpenTelemetry, sem nada que
+identifique alguém (ADR-0022).
 """
 
 import threading
@@ -26,7 +29,7 @@ from typing import Any, Literal, Protocol
 
 import mlflow
 import polars as pl
-from fastapi import FastAPI, HTTPException, Response
+from fastapi import FastAPI, HTTPException, Request, Response
 from mlflow.tracking import MlflowClient
 from pydantic import AwareDatetime, BaseModel, Field, model_validator
 
@@ -34,6 +37,7 @@ from antifraude_pix.dados.esquema import BANCO
 from antifraude_pix.rastreio.experimentos import endereco
 from antifraude_pix.rastreio.registro import CAMPEAO, NOME
 from antifraude_pix.tempo_real.estado import ESQUEMA, Estado, PixNovo
+from antifraude_pix.tempo_real.telemetria import Telemetria, id_do_traco
 
 BANCOS = tuple(BANCO.categories.to_list())
 
@@ -81,6 +85,9 @@ class Decisao(BaseModel):
     modelo: str
     versao: str
     milissegundos: float = Field(description="O tempo da decisão dentro do serviço, sem a rede.")
+    traco: str | None = Field(
+        default=None, description="O id do traço da decisão, para o banco guardar junto do Pix: nada, sem telemetria."
+    )
 
 
 class Confirmacao(BaseModel):
@@ -111,33 +118,61 @@ class Saude(BaseModel):
     segurados: int
 
 
-def criar(estado: Estado, decisor: Decisor, versao: str, modelo: str = NOME) -> FastAPI:
-    """A API, com o estado do banco e o modelo que decide."""
+def criar(
+    estado: Estado, decisor: Decisor, versao: str, modelo: str = NOME, telemetria: Telemetria | None = None
+) -> FastAPI:
+    """A API, com o estado do banco e o modelo que decide, e a telemetria: sem ela, a dos provedores globais."""
+    observada = telemetria or Telemetria.de()
     app = FastAPI(
         title="Antifraude Pix",
         description="Decide cada Pix antes de ele sair: aprovar, segurar para confirmar ou bloquear, com o porquê.",
         version=versao,
+        telemetry=observada.do_fastapi(),
     )
     cadeado = threading.Lock()
     segurados: dict[int, PixNovo] = {}
 
     @app.post("/pix")
-    def decidir_o_pix(entrada: PixDeEntrada) -> Decisao:
+    def decidir_o_pix(entrada: PixDeEntrada, pedido: Request) -> Decisao:
         """Decide o Pix que chegou, com as variáveis do que o banco sabia antes dele."""
         comeco = time.perf_counter()
         pix = PixNovo(**entrada.model_dump())
 
-        with cadeado:
-            if estado.conhece(pix.id) or pix.id in segurados:
-                raise HTTPException(409, f"O Pix {pix.id} já foi decidido.")
+        with observada.pedido("decidir o pix", pedido.headers) as traco:
+            with cadeado:
+                if estado.conhece(pix.id) or pix.id in segurados:
+                    raise HTTPException(409, f"O Pix {pix.id} já foi decidido.")
 
-            variaveis = _ou_erro(lambda: estado.variaveis(pix))
-            decidido = decisor.decidir_um(variaveis)
+                with observada.etapa("variaveis"):
+                    variaveis = _ou_erro(lambda: estado.variaveis(pix))
 
-            if decidido["acao"] == "aprovar":
-                estado.registrar(pix)
-            elif decidido["acao"] == "segurar":
-                segurados[pix.id] = pix
+                meio = time.perf_counter()
+
+                with observada.etapa("modelo"):
+                    decidido = decisor.decidir_um(variaveis)
+
+                fim = time.perf_counter()
+
+                if decidido["acao"] == "aprovar":
+                    estado.registrar(pix)
+                elif decidido["acao"] == "segurar":
+                    segurados[pix.id] = pix
+
+            milissegundos = (time.perf_counter() - comeco) * 1_000
+            observada.decidido(
+                traco,
+                acao=decidido["acao"],
+                probabilidade=decidido["probabilidade"],
+                valor=pix.valor,
+                iniciacao=pix.iniciacao,
+                recebedor_pessoa=pix.recebedor_pessoa,
+                versao=versao,
+                milissegundos={
+                    "variaveis": (meio - comeco) * 1_000,
+                    "modelo": (fim - meio) * 1_000,
+                    "total": milissegundos,
+                },
+            )
 
         return Decisao(
             id=pix.id,
@@ -146,13 +181,14 @@ def criar(estado: Estado, decisor: Decisor, versao: str, modelo: str = NOME) -> 
             explicacao=decidido["explicacao"],
             modelo=modelo,
             versao=versao,
-            milissegundos=(time.perf_counter() - comeco) * 1_000,
+            milissegundos=milissegundos,
+            traco=id_do_traco(traco),
         )
 
     @app.post("/pix/{id_}/confirmacao")
-    def confirmar(id_: int, confirmacao: Confirmacao) -> Confirmado:
+    def confirmar(id_: int, confirmacao: Confirmacao, pedido: Request) -> Confirmado:
         """A resposta do cliente ao Pix segurado: se ele confirma, o Pix sai e entra na história."""
-        with cadeado:
+        with observada.pedido("confirmar o pix", pedido.headers) as traco, cadeado:
             if id_ not in segurados:
                 raise HTTPException(404, f"O Pix {id_} não está esperando confirmação.")
 
@@ -160,22 +196,24 @@ def criar(estado: Estado, decisor: Decisor, versao: str, modelo: str = NOME) -> 
                 _ou_erro(lambda: estado.registrar(replace(segurados[id_], momento=confirmacao.momento)))
 
             del segurados[id_]
+            observada.respondido(traco, confirmado=confirmacao.confirmado)
 
         return Confirmado(id=id_, saiu=confirmacao.confirmado)
 
     @app.post("/aparelhos", status_code=204)
-    def aparelho_novo(aparelho: AparelhoNovo) -> Response:
+    def aparelho_novo(aparelho: AparelhoNovo, pedido: Request) -> Response:
         """Um aparelho entrou na conta do cliente."""
-        with cadeado:
+        with observada.pedido("aparelho novo", pedido.headers), cadeado:
             _ou_erro(lambda: estado.aparelho_novo(aparelho.cliente, aparelho.momento, aparelho.aparelho))
 
         return Response(status_code=204)
 
     @app.post("/contestacoes", status_code=204)
-    def contestar(contestacao: Contestacao) -> Response:
+    def contestar(contestacao: Contestacao, pedido: Request) -> Response:
         """A vítima contestou o Pix: o recebedor dele passa a ter mais uma contestação."""
-        with cadeado:
+        with observada.pedido("contestação", pedido.headers), cadeado:
             _ou_erro(lambda: estado.contestacao(contestacao.transacao, contestacao.momento))
+            observada.contestacoes.add(1)
 
         return Response(status_code=204)
 
@@ -196,15 +234,20 @@ def carregar_o_campeao(pasta_dos_dados: Path) -> tuple[Decisor, str]:
     """
     mlflow.set_tracking_uri(endereco(pasta_dos_dados))
     versao = str(MlflowClient().get_model_version_by_alias(NOME, CAMPEAO).version)
-    carregado = mlflow.pyfunc.load_model(f"models:/{NOME}@{CAMPEAO}")
+
+    return decisor_de(mlflow.pyfunc.load_model(f"models:/{NOME}@{CAMPEAO}")), versao
+
+
+def decisor_de(carregado: Any) -> Decisor:
+    """O decisor de um modelo que o MLflow carregou: o caminho de um Pix só, se ele tem; senão, o `predict`."""
     por_dentro = carregado.unwrap_python_model()
 
     if callable(getattr(por_dentro, "decidir_um", None)):
         decisor: Decisor = por_dentro
 
-        return decisor, versao
+        return decisor
 
-    return PeloMlflow(carregado), versao
+    return PeloMlflow(carregado)
 
 
 class PeloMlflow:
