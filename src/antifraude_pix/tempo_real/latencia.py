@@ -96,12 +96,12 @@ def medir_pela_api(app: FastAPI, os_eventos: Sequence[Evento]) -> pl.DataFrame:
     """
     linhas = []
 
-    with _servidor(app) as porta:
+    with servidor(app) as porta:
         conexao = http.client.HTTPConnection("127.0.0.1", porta, timeout=30)
 
         for evento in os_eventos:
             if evento.tipo == "aparelho":
-                _pedir(
+                pedir(
                     conexao,
                     "/aparelhos",
                     {campo: evento.dados[campo] for campo in ("cliente", "aparelho")} | {"momento": evento.momento},
@@ -109,11 +109,11 @@ def medir_pela_api(app: FastAPI, os_eventos: Sequence[Evento]) -> pl.DataFrame:
                 continue
 
             if evento.tipo == "contestacao":
-                _pedir(conexao, "/contestacoes", {"transacao": evento.dados["transacao"], "momento": evento.momento})
+                pedir(conexao, "/contestacoes", {"transacao": evento.dados["transacao"], "momento": evento.momento})
                 continue
 
             comeco = time.perf_counter_ns()
-            decisao = _pedir(conexao, "/pix", _do_pix(evento.dados))
+            decisao = pedir(conexao, "/pix", do_pix(evento.dados))
             ida_e_volta = (time.perf_counter_ns() - comeco) / 1e6
             linhas.append(
                 {
@@ -125,7 +125,7 @@ def medir_pela_api(app: FastAPI, os_eventos: Sequence[Evento]) -> pl.DataFrame:
             )
 
             if decisao["acao"] == "segurar":
-                _pedir(conexao, f"/pix/{decisao['id']}/confirmacao", {"confirmado": True, "momento": evento.momento})
+                pedir(conexao, f"/pix/{decisao['id']}/confirmacao", {"confirmado": True, "momento": evento.momento})
 
         conexao.close()
 
@@ -164,11 +164,13 @@ def _seguidos(estado: Estado, os_eventos: Sequence[Evento]) -> Iterator[PixNovo]
             yield PixNovo(**{campo: evento.dados[campo] for campo in PixNovo.__dataclass_fields__})
 
 
-def _do_pix(linha: dict[str, Any]) -> dict[str, Any]:
+def do_pix(linha: dict[str, Any]) -> dict[str, Any]:
+    """O Pix de uma linha das transações, como o banco o manda à API."""
     return {campo: linha[campo] for campo in PixNovo.__dataclass_fields__}
 
 
-def _pedir(conexao: http.client.HTTPConnection, caminho: str, corpo: dict[str, Any]) -> dict[str, Any]:
+def pedir(conexao: http.client.HTTPConnection, caminho: str, corpo: dict[str, Any]) -> dict[str, Any]:
+    """Manda o evento à API e devolve a resposta; a contestação de um Pix que não saiu volta vazia."""
     conexao.request("POST", caminho, json.dumps(corpo, default=_em_json), {"Content-Type": "application/json"})
     resposta = conexao.getresponse()
     conteudo = resposta.read()
@@ -191,17 +193,17 @@ def _em_json(valor: object) -> str:
 
 
 @contextmanager
-def _servidor(app: FastAPI) -> Iterator[int]:
+def servidor(app: FastAPI) -> Iterator[int]:
     """O serviço num servidor uvicorn de verdade, numa porta livre da própria máquina, enquanto durar o bloco."""
-    servidor = uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=0, log_level="warning"))
-    fio = threading.Thread(target=servidor.run, daemon=True)
+    rodando = uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=0, log_level="warning"))
+    fio = threading.Thread(target=rodando.run, daemon=True)
     fio.start()
 
     try:
-        while not servidor.started:
+        while not rodando.started:
             time.sleep(0.01)
 
-        yield int(servidor.servers[0].sockets[0].getsockname()[1])
+        yield int(rodando.servers[0].sockets[0].getsockname()[1])
     finally:
-        servidor.should_exit = True
+        rodando.should_exit = True
         fio.join(timeout=10)
