@@ -1,5 +1,7 @@
 import hashlib
 import json
+import re
+import socket
 from datetime import date
 from pathlib import Path
 from typing import Any
@@ -10,13 +12,23 @@ import uvicorn
 from fastapi.testclient import TestClient
 from mlflow.tracking import MlflowClient
 
+from antifraude_pix import cli
 from antifraude_pix.cartoes import base as base_dos_cartoes
 from antifraude_pix.cli import principal
 from antifraude_pix.monitoramento.rotulo import ALARME
 from antifraude_pix.rastreio.experimentos import EXPERIMENTO, VARIANTES, endereco
 from antifraude_pix.rastreio.registro import CAMPEAO, DESAFIANTE, NOME, VEREDITO
+from antifraude_pix.tempo_real.latencia import servidor
+from antifraude_pix.tempo_real.reproducao import Placar
+from antifraude_pix.tempo_real.telemetria import ENDERECO
 from antifraude_pix.variaveis.catalogo import NOMES
 from tests.apoio import cartoes_inventados
+
+
+@pytest.fixture(autouse=True)
+def sem_coletor(monkeypatch: pytest.MonkeyPatch) -> None:
+    """O endereço do coletor, se estiver no ambiente de quem roda os testes, ligaria a telemetria do processo todo."""
+    monkeypatch.delenv(ENDERECO, raising=False)
 
 
 def test_simular_grava_os_dados_e_conta_o_que_saiu(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
@@ -287,6 +299,134 @@ def test_servir_sem_campeao_falha_com_o_motivo(tmp_path: Path, capsys: pytest.Ca
 
     assert principal(["servir", str(tmp_path)]) == 1
     assert "antifraude-pix servir: não consegui subir o serviço" in capsys.readouterr().err
+
+
+def test_o_pacote_serve_a_historia_ate_um_dia_e_a_reproducao_manda_o_resto(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    principal(["simular", "--clientes", "150", "--dias", "125", "--golpes-por-mil", "200", "--saida", str(tmp_path)])
+    principal(["registrar", str(tmp_path)])
+    capsys.readouterr()
+
+    assert principal(["empacotar", str(tmp_path)]) == 0
+    assert f"antifraude-pix servir {tmp_path} --pacote {tmp_path / 'campeao'}" in capsys.readouterr().out
+
+    servidas: list[Any] = []
+    ligadas: list[str] = []
+
+    def configurar(versao: str) -> bool:
+        ligadas.append(versao)
+        return True
+
+    monkeypatch.setattr(uvicorn, "run", lambda app, **opcoes: servidas.append((app, opcoes)))
+    monkeypatch.setattr(cli, "configurar", configurar)
+    monkeypatch.setenv(ENDERECO, "http://coletor:4318")
+    servir = [
+        "servir",
+        str(tmp_path),
+        "--pacote",
+        str(tmp_path / "campeao"),
+        "--ate",
+        "2025-11-01",
+        "--host",
+        "0.0.0.0",
+    ]
+
+    assert principal(servir) == 0
+
+    ((app, opcoes),) = servidas
+    transacoes = pl.read_parquet(tmp_path / "banco" / "transacoes.parquet")
+    impresso = capsys.readouterr().out
+
+    assert "da história até 01/11/2025" in impresso
+    assert "A telemetria vai para http://coletor:4318." in impresso
+    assert ligadas == ["1"]
+    assert opcoes["host"] == "0.0.0.0"
+    assert TestClient(app).get("/saude").json()["versao"] == "1"
+    assert (
+        TestClient(app).get("/saude").json()["pix_no_estado"]
+        == transacoes.filter(pl.col("momento").dt.date() < date(2025, 11, 1)).height
+    )
+
+    with servidor(app) as porta:
+        reproduzir = [
+            "reproduzir",
+            f"http://127.0.0.1:{porta}",
+            str(tmp_path),
+            "--de",
+            "2025-11-01",
+            "--velocidade",
+            "0",
+        ]
+
+        assert principal(reproduzir) == 0
+
+    impresso = capsys.readouterr().out
+    no_periodo = re.search(
+        r"No período: ([\d.]+) Pix, ([\d.]+) aprovados, ([\d.]+) segurados \(([\d.]+) confirmados", impresso
+    )
+    assert no_periodo is not None
+    pix, aprovados, _, confirmados = (int(numero.replace(".", "")) for numero in no_periodo.groups())
+
+    assert "01/11: " in impresso
+    assert "02/11: " in impresso
+    assert pix == transacoes.filter(pl.col("momento").dt.date() >= date(2025, 11, 1)).height
+    # O Pix aprovado e o segurado que o cliente confirmou entram na história; o bloqueado e o recusado, não.
+    assert TestClient(app).get("/saude").json() | {"segurados": 0} == {
+        "modelo": NOME,
+        "versao": "1",
+        "pix_no_estado": transacoes.height - pix + aprovados + confirmados,
+        "segurados": 0,
+    }
+
+
+def test_empacotar_sem_campeao_falha_com_o_motivo(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    principal(["simular", "--clientes", "30", "--dias", "10", "--saida", str(tmp_path)])
+    capsys.readouterr()
+
+    assert principal(["empacotar", str(tmp_path)]) == 1
+    assert "antifraude-pix empacotar: não consegui empacotar o campeao" in capsys.readouterr().err
+
+
+def test_reproduzir_passa_a_verdade_dos_golpes_e_o_periodo_pedido(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A vítima segurada recusa a confirmação: a reprodução precisa saber, pela verdade, quem é vítima.
+    principal(["simular", "--clientes", "150", "--dias", "60", "--golpes-por-mil", "200", "--saida", str(tmp_path)])
+    capsys.readouterr()
+    pedidos: list[dict[str, Any]] = []
+
+    def reproduzir(os_eventos: list[Any], endereco: str, **opcoes: Any) -> Placar:
+        pedidos.append({"eventos": os_eventos, "endereco": endereco, **opcoes})
+        return Placar()
+
+    monkeypatch.setattr(cli, "reproduzir", reproduzir)
+
+    assert principal(["reproduzir", "http://api:8000", str(tmp_path), "--de", "2025-08-20", "--ate", "2025-08-22"]) == 0
+
+    (pedido,) = pedidos
+    golpes = pl.read_parquet(tmp_path / "verdade" / "fraudes.parquet")["transacao"]
+
+    assert pedido["golpes"] == frozenset(golpes.to_list())
+    assert len(pedido["golpes"]) > 0
+    assert pedido["velocidade"] == 600
+    assert {evento.momento.date() for evento in pedido["eventos"]} == {date(2025, 8, 20), date(2025, 8, 21)}
+
+
+def test_reproduzir_sem_a_api_ou_sem_eventos_falha_com_o_motivo(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    principal(["simular", "--clientes", "30", "--dias", "10", "--saida", str(tmp_path)])
+    capsys.readouterr()
+
+    with socket.socket() as livre:
+        livre.bind(("127.0.0.1", 0))
+        porta = livre.getsockname()[1]
+
+    assert principal(["reproduzir", f"http://127.0.0.1:{porta}", str(tmp_path), "--de", "2025-07-05"]) == 1
+    assert "parou de aceitar os eventos" in capsys.readouterr().err
+    assert principal(["reproduzir", f"http://127.0.0.1:{porta}", str(tmp_path), "--de", "2025-08-01"]) == 1
+    assert "não têm eventos de 01/08/2025" in capsys.readouterr().err
 
 
 def test_monitorar_e_retreinar_acompanham_o_campeao_e_o_poem_contra_o_desafiante(

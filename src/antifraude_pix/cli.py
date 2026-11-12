@@ -8,18 +8,23 @@
 - `experimentos` refaz no MLflow as medidas que decidiram o desenho dos modelos;
 - `registrar` treina o modelo final, ou o de um corte, e o registra no MLflow, com a ficha, como o campeão;
 - `cartoes` roda o mesmo processo na base pública de cartões da ULB;
-- `servir` põe de pé a API que decide cada Pix em tempo real, com o campeão do registro;
+- `servir` põe de pé a API que decide cada Pix em tempo real, com o campeão do registro ou de um pacote;
 - `latencia` mede quanto o serviço leva para decidir cada Pix, por dentro e pela API;
+- `empacotar` copia o campeão do registro para uma pasta que roda em qualquer máquina, como num contêiner;
+- `reproduzir` manda à API os eventos de um período, no ritmo do banco, para o painel ter o que mostrar;
 - `monitorar` acompanha o campeão semana a semana: a deriva, as saídas e a perda que o rótulo mostra;
 - `retreinar` treina um desafiante, o compara com o campeão nos mesmos Pix, e o promove se ele ganhar.
 """
 
 import argparse
+import os
 import sys
 import time
 from collections.abc import Callable, Sequence
 from datetime import date, datetime, timedelta
+from datetime import time as meia_noite
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import polars as pl
 import uvicorn
@@ -36,6 +41,7 @@ from antifraude_pix.cartoes.processo import NOMES as NOMES_NOS_CARTOES
 from antifraude_pix.cartoes.processo import avaliar as avaliar_os_cartoes
 from antifraude_pix.cartoes.rastreio import rastrear as rastrear_os_cartoes
 from antifraude_pix.dados.banco import VisaoDoBanco
+from antifraude_pix.dados.esquema import FUSO
 from antifraude_pix.dados.gravacao import gravar, ler, ler_o_banco
 from antifraude_pix.dados.validacao import problemas
 from antifraude_pix.decisao.custo import Acao, decidir
@@ -54,7 +60,10 @@ from antifraude_pix.simulacao.golpes import NOMES, Golpe
 from antifraude_pix.simulacao.simulador import Simulacao, simular
 from antifraude_pix.tempo_real.estado import Estado
 from antifraude_pix.tempo_real.latencia import Evento, eventos, medir_pela_api, medir_por_dentro, resumir
-from antifraude_pix.tempo_real.servico import carregar_o_campeao, criar
+from antifraude_pix.tempo_real.pacote import abrir, empacotar
+from antifraude_pix.tempo_real.reproducao import Placar, reproduzir
+from antifraude_pix.tempo_real.servico import Decisor, carregar_o_campeao, criar
+from antifraude_pix.tempo_real.telemetria import ENDERECO, configurar
 from antifraude_pix.variaveis.calculo import calcular
 from antifraude_pix.variaveis.catalogo import CATALOGO
 
@@ -74,8 +83,17 @@ def principal(argumentos: Sequence[str] | None = None) -> int:
         "experimentos": lambda: _experimentos(pedido.pasta),
         "registrar": lambda: _registrar(pedido.pasta, pedido.ficha, pedido.corte),
         "cartoes": lambda: _cartoes(pedido.pasta),
-        "servir": lambda: _servir(pedido.pasta, pedido.porta),
+        "servir": lambda: _servir(pedido.pasta, pedido.porta, host=pedido.host, ate=pedido.ate, pacote=pedido.pacote),
         "latencia": lambda: _latencia(pedido.pasta, pedido.pix),
+        "empacotar": lambda: _empacotar(pedido.pasta, pedido.destino, pedido.apelido),
+        "reproduzir": lambda: _reproduzir(
+            pedido.endereco,
+            pedido.pasta,
+            de=pedido.de,
+            ate=pedido.ate,
+            velocidade=pedido.velocidade,
+            semente=pedido.semente,
+        ),
         "monitorar": lambda: _monitorar(pedido.pasta, pedido.ate, pedido.saida),
         "retreinar": lambda: _retreinar(pedido.pasta, pedido.ate),
     }
@@ -176,19 +194,7 @@ def _leitor() -> argparse.ArgumentParser:
     )
     cartoes.add_argument("pasta", type=Path, nargs="?", default=Path("dados"), help="a pasta dos dados (padrão: dados)")
 
-    servir = comandos.add_parser(
-        "servir", help="põe de pé a API que decide cada Pix em tempo real, com o campeão do registro do MLflow"
-    )
-    servir.add_argument("pasta", type=Path, nargs="?", default=Path("dados"), help="a pasta dos dados (padrão: dados)")
-    servir.add_argument("--porta", type=int, default=8000, help="a porta da API (padrão: %(default)s)")
-
-    latencia = comandos.add_parser(
-        "latencia", help="mede quanto o serviço leva para decidir cada Pix do último mês, por dentro e pela API"
-    )
-    latencia.add_argument(
-        "pasta", type=Path, nargs="?", default=Path("dados"), help="a pasta dos dados (padrão: dados)"
-    )
-    latencia.add_argument("--pix", type=int, default=5_000, help="quantos Pix em cada medida (padrão: %(default)s)")
+    _os_do_servico(comandos)
 
     ajuda_do_ate = "o dia de hoje, AAAA-MM-DD: vale o que o banco sabia na meia-noite dele (padrão: o fim dos dados)"
     monitorar = comandos.add_parser(
@@ -211,6 +217,78 @@ def _leitor() -> argparse.ArgumentParser:
     retreinar.add_argument("--ate", type=date.fromisoformat, help=ajuda_do_ate)
 
     return leitor
+
+
+def _os_do_servico(comandos: "argparse._SubParsersAction[argparse.ArgumentParser]") -> None:
+    """Os comandos do serviço: servir, medir a latência, empacotar o campeão e reproduzir os eventos."""
+    servir = comandos.add_parser(
+        "servir", help="põe de pé a API que decide cada Pix em tempo real, com o campeão do registro ou de um pacote"
+    )
+    servir.add_argument("pasta", type=Path, nargs="?", default=Path("dados"), help="a pasta dos dados (padrão: dados)")
+    servir.add_argument("--porta", type=int, default=8000, help="a porta da API (padrão: %(default)s)")
+    servir.add_argument(
+        "--host", default="127.0.0.1", help="onde a API escuta: 0.0.0.0 dentro de um contêiner (padrão: %(default)s)"
+    )
+    servir.add_argument(
+        "--ate",
+        type=date.fromisoformat,
+        help="sobe o estado com o que o banco sabia na meia-noite deste dia, AAAA-MM-DD; os eventos daí em diante "
+        "chegam pela API (padrão: tudo o que os dados têm)",
+    )
+    servir.add_argument(
+        "--pacote", type=Path, help="a pasta de um pacote do `empacotar`, no lugar do campeão do registro do MLflow"
+    )
+
+    latencia = comandos.add_parser(
+        "latencia", help="mede quanto o serviço leva para decidir cada Pix do último mês, por dentro e pela API"
+    )
+    latencia.add_argument(
+        "pasta", type=Path, nargs="?", default=Path("dados"), help="a pasta dos dados (padrão: dados)"
+    )
+    latencia.add_argument("--pix", type=int, default=5_000, help="quantos Pix em cada medida (padrão: %(default)s)")
+
+    empacotar_ = comandos.add_parser(
+        "empacotar", help="copia o campeão do registro para uma pasta que roda em qualquer máquina, sem o registro"
+    )
+    empacotar_.add_argument(
+        "pasta", type=Path, nargs="?", default=Path("dados"), help="a pasta dos dados (padrão: dados)"
+    )
+    empacotar_.add_argument(
+        "--destino", type=Path, help="a pasta do pacote (padrão: campeao, dentro da pasta dos dados)"
+    )
+    empacotar_.add_argument(
+        "--apelido",
+        default=CAMPEAO,
+        choices=(CAMPEAO, DESAFIANTE),
+        help="o modelo de qual apelido (padrão: %(default)s)",
+    )
+
+    reproduzir_ = comandos.add_parser(
+        "reproduzir", help="manda à API os eventos de um período, no ritmo do banco, como se acontecessem agora"
+    )
+    reproduzir_.add_argument("endereco", help="o endereço da API, como http://127.0.0.1:8000")
+    reproduzir_.add_argument(
+        "pasta", type=Path, nargs="?", default=Path("dados"), help="a pasta dos dados (padrão: dados)"
+    )
+    reproduzir_.add_argument(
+        "--de",
+        type=date.fromisoformat,
+        required=True,
+        help="o primeiro dia, AAAA-MM-DD: o mesmo do --ate com que a API subiu",
+    )
+    reproduzir_.add_argument(
+        "--ate", type=date.fromisoformat, help="o dia em que a reprodução para, sem ele (padrão: o fim dos dados)"
+    )
+    reproduzir_.add_argument(
+        "--velocidade",
+        type=float,
+        default=600.0,
+        help="quantas vezes mais depressa que o banco: com 600, uma hora passa em seis segundos; com 0, vai o mais "
+        "depressa que a API responde (padrão: %(default)s)",
+    )
+    reproduzir_.add_argument(
+        "--semente", type=int, default=0, help="a semente de quais vítimas recusam a confirmação (padrão: %(default)s)"
+    )
 
 
 def _simular(pedido: argparse.Namespace) -> int:
@@ -497,25 +575,127 @@ def _cartoes(pasta: Path) -> int:
     return 0
 
 
-def _servir(pasta: Path, porta: int) -> int:
-    """Sobe o estado com toda a história do banco, carrega o campeão e serve a API, até alguém parar (ADR-0017)."""
+def _servir(pasta: Path, porta: int, *, host: str, ate: date | None, pacote: Path | None) -> int:
+    """Sobe o estado com a história do banco, carrega o modelo e serve a API, até alguém parar (ADR-0017 e 0023).
+
+    O modelo é o campeão do registro, ou o do pacote. Com o endereço do coletor no ambiente, a telemetria vai para
+    ele (ADR-0022).
+    """
     try:
         visao = ler_o_banco(pasta)
-        decisor, versao = carregar_o_campeao(pasta)
+        decisor, versao = _o_modelo(pasta, pacote)
     except (OSError, ValueError, KeyError, TypeError, MlflowException) as erro:
         print(f"antifraude-pix servir: não consegui subir o serviço com {pasta}: {erro}", file=sys.stderr)
         return 1
 
     comeco = time.perf_counter()
-    estado = Estado.da_historia(visao)
+    estado = Estado.da_historia(visao if ate is None else visao.ate(ate))
+    historia = "" if ate is None else f", da história até {ate:%d/%m/%Y}"
     print(
-        f"O estado do banco subiu com {_numero(estado.pix)} Pix em {_numero(round(time.perf_counter() - comeco))} s. "
-        f"Quem decide é o {NOME}, versão {versao}."
+        f"O estado do banco subiu com {_numero(estado.pix)} Pix{historia}, em "
+        f"{_numero(round(time.perf_counter() - comeco))} s. Quem decide é o {NOME}, versão {versao}."
     )
-    print(f"A API está em http://127.0.0.1:{porta}, e a documentação, em http://127.0.0.1:{porta}/docs.")
-    uvicorn.run(criar(estado, decisor, versao), host="127.0.0.1", port=porta, log_level="warning")
+
+    if configurar(versao):
+        print(f"A telemetria vai para {os.environ[ENDERECO]}.")
+
+    print(f"A API está em http://{host}:{porta}, e a documentação, em http://{host}:{porta}/docs.")
+    uvicorn.run(criar(estado, decisor, versao), host=host, port=porta, log_level="warning")
 
     return 0
+
+
+def _o_modelo(pasta: Path, pacote: Path | None) -> tuple[Decisor, str]:
+    """O decisor e a versão dele: o campeão do registro da pasta, ou o do pacote."""
+    if pacote is None:
+        return carregar_o_campeao(pasta)
+
+    decisor, aberto = abrir(pacote)
+
+    return decisor, aberto.versao
+
+
+def _empacotar(pasta: Path, destino: Path | None, apelido: str) -> int:
+    """Copia o modelo do apelido para o pacote, que o serviço abre sem o registro (ADR-0023)."""
+    destino = destino or pasta / "campeao"
+
+    try:
+        pacote = empacotar(pasta, destino, apelido)
+    except (OSError, KeyError, MlflowException) as erro:
+        print(f"antifraude-pix empacotar: não consegui empacotar o {apelido} de {pasta}: {erro}", file=sys.stderr)
+        return 1
+
+    treino = (
+        ""
+        if pacote.corte is None
+        else f", treinado com o que o banco sabia em {date.fromisoformat(pacote.corte):%d/%m/%Y}"
+    )
+    print(f"O {pacote.apelido} do registro, o {pacote.nome} versão {pacote.versao}{treino}, está em {destino}.")
+    print(f"Para servi-lo: antifraude-pix servir {pasta} --pacote {destino}")
+
+    return 0
+
+
+def _reproduzir(endereco: str, pasta: Path, *, de: date, ate: date | None, velocidade: float, semente: int) -> int:
+    """Manda à API os eventos do período, no ritmo do banco vezes a velocidade, e conta o que ela decidiu (ADR-0024)."""
+    try:
+        # A reprodução faz o papel do mundo: lê a verdade, para saber qual cliente segurado é vítima de golpe.
+        simulacao = ler(pasta)
+    except (OSError, ValueError, KeyError) as erro:
+        print(f"antifraude-pix reproduzir: não consegui ler {pasta}: {erro}", file=sys.stderr)
+        return 1
+
+    visao = VisaoDoBanco.da(simulacao)
+    fim = ate or _o_fim(visao)
+    fuso = ZoneInfo(FUSO)
+    do_periodo = eventos(visao, datetime.combine(de, meia_noite(), fuso), datetime.combine(fim, meia_noite(), fuso))
+
+    if not do_periodo:
+        print(
+            f"antifraude-pix reproduzir: os dados de {pasta} não têm eventos de {de:%d/%m/%Y} a {fim:%d/%m/%Y}.",
+            file=sys.stderr,
+        )
+        return 1
+
+    ritmo = (
+        "o mais depressa que a API responde"
+        if velocidade == 0
+        else f"{_numero(round(velocidade))} vezes mais depressa que o banco"
+    )
+    print(
+        f"{_numero(len(do_periodo))} eventos, de {de:%d/%m/%Y} até antes de {fim:%d/%m/%Y}, para {endereco}, {ritmo}."
+    )
+
+    def ao_fim_do_dia(dia: date, placar: Placar) -> None:
+        print(f"{dia:%d/%m}: {_o_placar(placar)}", flush=True)
+
+    try:
+        placar = reproduzir(
+            do_periodo,
+            endereco,
+            golpes=frozenset(simulacao.verdade.fraudes["transacao"].to_list()),
+            velocidade=velocidade or None,
+            semente=semente,
+            ao_fim_do_dia=ao_fim_do_dia,
+        )
+    except (OSError, RuntimeError) as erro:
+        print(
+            f"antifraude-pix reproduzir: a API em {endereco} parou de aceitar os eventos: {erro}. Ela subiu com "
+            f"--ate {de:%Y-%m-%d}?",
+            file=sys.stderr,
+        )
+        return 1
+
+    print(f"No período: {_o_placar(placar)}")
+
+    return 0
+
+
+def _o_placar(placar: Placar) -> str:
+    return (
+        f"{_numero(placar.pix)} Pix, {_numero(placar.aprovados)} aprovados, {_numero(placar.segurados)} segurados "
+        f"({_numero(placar.confirmados)} confirmados pelo cliente), {_numero(placar.bloqueados)} bloqueados."
+    )
 
 
 def _latencia(pasta: Path, quantos: int) -> int:
@@ -526,6 +706,9 @@ def _latencia(pasta: Path, quantos: int) -> int:
     except (OSError, ValueError, KeyError, TypeError, MlflowException) as erro:
         print(f"antifraude-pix latencia: não consegui medir com {pasta}: {erro}", file=sys.stderr)
         return 1
+
+    if configurar(versao):
+        print(f"Com a telemetria indo para {os.environ[ENDERECO]}.")
 
     ultimo = visao.transacoes["momento"].max()
 
