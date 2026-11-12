@@ -48,3 +48,47 @@ jobs:
 
       - name: Testes
         run: uv run pytest
+
+  imagem:
+    name: Imagem, fumaça e entrega
+    # A imagem só é feita do commit que passou em tudo acima.
+    needs: verificacao
+    runs-on: ubuntu-latest
+    # Só este job escreve no GitHub Container Registry, e só no push para a main.
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        with:
+          version: '0.13.7'
+          enable-cache: true
+
+      - name: Instalar o ambiente
+        run: uv sync --locked
+
+      # Dados pequenos, o campeão empacotado, a imagem, o contêiner saudável,
+      # e os Pix de dois dias decididos pela API: o mesmo roteiro de qualquer
+      # máquina (ADR-0025).
+      - name: Construir a imagem e passar a fumaça
+        env:
+          FONTE: ${{ github.server_url }}/${{ github.repository }}
+          REVISAO: ${{ github.sha }}
+        run: bash implantacao/fumaca.sh antifraude-pix:ci
+
+      # A imagem que passou na fumaça é a que vai, com o commit no nome. O
+      # registro quer o nome em minúsculas.
+      - name: Publicar no GitHub Container Registry
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        env:
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          imagem="ghcr.io/${GITHUB_REPOSITORY,,}"
+          echo "$TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+          docker tag antifraude-pix:ci "$imagem:$GITHUB_SHA"
+          docker tag antifraude-pix:ci "$imagem:latest"
+          docker push "$imagem:$GITHUB_SHA"
+          docker push "$imagem:latest"

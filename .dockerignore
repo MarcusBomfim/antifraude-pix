@@ -1,0 +1,10 @@
+# A imagem leva só o que precisa para instalar o pacote: o pyproject, o
+# uv.lock, a versão do Python, a licença e o código. Os dados, o ambiente
+# local, os testes e a documentação ficam de fora.
+*
+!pyproject.toml
+!uv.lock
+!.python-version
+!LICENSE
+!src/
+**/__pycache__

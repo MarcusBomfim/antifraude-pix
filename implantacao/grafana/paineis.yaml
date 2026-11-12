@@ -1,0 +1,9 @@
+# O painel vem do repositório, e não da tela: quem muda o painel muda o painel.json.
+apiVersion: 1
+
+providers:
+  - name: antifraude-pix
+    type: file
+    allowUiUpdates: false
+    options:
+      path: /var/lib/grafana/paineis

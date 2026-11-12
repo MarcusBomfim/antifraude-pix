@@ -3,9 +3,9 @@
 [![CI](https://github.com/MarcusBomfim/antifraude-pix/actions/workflows/ci.yml/badge.svg)](https://github.com/MarcusBomfim/antifraude-pix/actions/workflows/ci.yml)
 [![Licença: MIT](https://img.shields.io/badge/licen%C3%A7a-MIT-blue.svg)](LICENSE)
 
-Detecção de fraude em Pix, do lado do banco de quem paga: o banco tem alguns milissegundos para decidir se cada Pix sai, segura para confirmar ou é bloqueado. O projeto começa por um simulador de transações com os golpes que acontecem no Brasil — o falso parente, a falsa central, a invasão de conta e a venda falsa — e com o rótulo que o banco tem de verdade: a contestação, que chega dias depois e nem sempre chega. Sobre esses dados vêm as variáveis calculadas sem olhar o futuro, os modelos validados no tempo com o rótulo que o banco tinha no dia, e a decisão de cada Pix pelo custo, explicada em português e medida para não errar mais com os mais velhos. Os experimentos ficam rastreados no MLflow, o modelo vai registrado com a sua ficha, e o mesmo processo roda numa base real, de cartões. O serviço decide cada Pix em tempo real, numa API, com as mesmas variáveis do treino, provadas Pix a Pix, e com a latência medida. O monitor acompanha o modelo semana a semana, percebe pelo rótulo atrasado o golpe novo que a deriva dos dados não vê, e o retreino só troca o modelo quando o novo ganha nos mesmos Pix. Na próxima parte, vem a entrega.
+Detecção de fraude em Pix, do lado do banco de quem paga: o banco tem alguns milissegundos para decidir se cada Pix sai, segura para confirmar ou é bloqueado. O projeto começa por um simulador de transações com os golpes que acontecem no Brasil — o falso parente, a falsa central, a invasão de conta e a venda falsa — e com o rótulo que o banco tem de verdade: a contestação, que chega dias depois e nem sempre chega. Sobre esses dados vêm as variáveis calculadas sem olhar o futuro, os modelos validados no tempo com o rótulo que o banco tinha no dia, e a decisão de cada Pix pelo custo, explicada em português e medida para não errar mais com os mais velhos. Os experimentos ficam rastreados no MLflow, o modelo vai registrado com a sua ficha, e o mesmo processo roda numa base real, de cartões. O serviço decide cada Pix em tempo real, numa API, com as mesmas variáveis do treino, provadas Pix a Pix, e com a latência medida. O monitor acompanha o modelo semana a semana, percebe pelo rótulo atrasado o golpe novo que a deriva dos dados não vê, e o retreino só troca o modelo quando o novo ganha nos mesmos Pix. O serviço vai para uma imagem Docker que o CI só publica depois de vê-la decidindo Pix, observado pelo OpenTelemetry sem nenhum dado pessoal, num painel do Grafana.
 
-Python 3.13 · uv · NumPy · Polars · Parquet · scikit-learn · LightGBM · MLflow · FastAPI · uvicorn · matplotlib · pytest · hypothesis · ruff · mypy · GitHub Actions
+Python 3.13 · uv · NumPy · Polars · Parquet · scikit-learn · LightGBM · MLflow · FastAPI · uvicorn · OpenTelemetry · Docker · Prometheus · Grafana · Jaeger · matplotlib · pytest · hypothesis · ruff · mypy · GitHub Actions
 
 > Projeto independente, de estudo e portfólio. Não tem ligação com nenhum banco nem com o Banco Central. Os dados são de um simulador: não há nenhum dado real de cliente, nem nenhuma transação de verdade.
 
@@ -308,6 +308,48 @@ O alarme não troca o modelo sozinho. O retreino põe um desafiante, a mesma rec
 
 Com a virada, o desafiante fica com o apelido de campeão no registro do MLflow, e a API passa a carregá-lo. Sem ela, ele fica registrado como desafiante, com o veredito, e o campeão continua. A verdade de dezembro, que só o simulador tem, deu razão às duas decisões. Com a virada, a troca cortou o custo do mês de R$ 72 mil para R$ 33 mil, e a falsa central pega foi de 111 para 130 de 141. Sem ela, os dois modelos empataram na precisão média, em 0,959, e o desafiante custaria R$ 1.669 a mais.
 
+## A entrega, a telemetria e o painel
+
+O serviço vai para o ar numa imagem Docker. Para isso, três problemas tiveram de ser resolvidos.
+
+**O primeiro: tirar o modelo do registro.** O registro do MLflow guarda os artefatos pelo caminho absoluto de quem treinou, `file:///C:/Users/...`, e no contêiner Linux esse caminho não existe. `antifraude-pix empacotar` copia o campeão para uma pasta que roda em qualquer máquina, com um `pacote.json` que diz qual modelo é ([ADR-0023](docs/adr/0023-o-campeao-empacotado.md)). O serviço no ar não lê mais o registro: trocar o modelo é empacotar de novo e subir de novo, e a versão vai em cada resposta.
+
+A primeira subida do contêiner achou um defeito do MLflow com o Windows. O `MLmodel` guarda o arquivo do modelo como código pelo caminho de quem registrou, `C:\Users\...\modelo_do_pix.py`. O MLflow acha esse arquivo cortando o caminho nas barras da máquina onde roda, e no Linux a barra invertida não corta nada. O pacote guarda só o nome.
+
+**O segundo: ver o serviço sem ver o cliente.** Cada pedido vira um traço do OpenTelemetry, com as variáveis e o modelo como etapas. Oito métricas contam os Pix, o dinheiro, a chance de golpe, o tempo de cada etapa e a resposta do cliente ao Pix segurado ([ADR-0022](docs/adr/0022-a-telemetria-sem-dado-pessoal.md)). Nada que identifique alguém sai do serviço:
+- os atributos são uma lista fechada de onze nomes, e o coletor apaga dos traços o que não estiver nela;
+- o valor exato vai só somado, nas métricas; no traço vai a faixa;
+- a mensagem de erro, que pode trazer um id, não vai: só o código HTTP;
+- o id do traço vai na resposta, para o banco guardá-lo do lado dele, junto do Pix.
+
+O Jaeger achou o furo que os testes não viam: o FastAPI 0.162 tem telemetria própria, ligada por padrão, e o traço dela guarda o caminho do pedido, que na confirmação tem o id do Pix. Ela fica desligada, e um teste monta a API com os provedores globais, como no contêiner, para provar que só a telemetria do serviço sai.
+
+O custo foi medido com o `antifraude-pix latencia`, em 5.000 Pix de dezembro, com a telemetria indo para o coletor:
+
+| Em milissegundos | Mediana | p95 | p99 |
+|---|--:|--:|--:|
+| dentro do serviço, sem telemetria | 0,30 | 0,45 | 0,70 |
+| dentro do serviço, com todos os traços | 0,39 | 0,71 | 1,25 |
+| dentro do serviço, com um traço a cada dez | 0,34 | 0,49 | 0,76 |
+| a ida e volta, sem telemetria | 1,21 | 1,56 | 1,94 |
+| a ida e volta, com todos os traços | 1,45 | 2,18 | **4,41** |
+| a ida e volta, com um traço a cada dez | 1,34 | 1,70 | **2,10** |
+
+Com todos os traços, o p99 da ida e volta mais que dobra, porque o envio em lote disputa o interpretador com os pedidos. Com um traço a cada dez, o custo quase some, e é o que o `compose` usa, sem mudar o código. As métricas contam todos os Pix.
+
+**O terceiro: um CI que só entrega a imagem que funciona** ([ADR-0025](docs/adr/0025-a-imagem-a-entrega-e-o-painel.md)). Depois da verificação de sempre, o job da imagem passa pela fumaça (`implantacao/fumaca.sh`):
+1. grava dados pequenos;
+2. registra e empacota o campeão;
+3. constrói a imagem;
+4. sobe o contêiner até ele ficar saudável;
+5. manda pela API os Pix dos dois últimos dias.
+
+No push para a `main`, a imagem que passou vai para o GitHub Container Registry, com o commit no nome.
+
+O `compose.yaml` sobe o serviço com o coletor do OpenTelemetry, o Prometheus, o Jaeger e o Grafana. Para o painel ter o que mostrar, `antifraude-pix reproduzir` manda à API os eventos do banco no ritmo deles, 600 vezes mais depressa, fazendo o papel do cliente que confirma ou recusa o Pix segurado ([ADR-0024](docs/adr/0024-a-reproducao.md)). No painel, o campeão da virada, treinado em 17 de novembro, decide os Pix de dezembro, e cada dia do banco passa em dois minutos e meio. Nos cinco primeiros dias, foram 88.079 Pix: 155 segurados, dos quais 7 vítimas recusaram a confirmação, e 43 bloqueados. A decisão levou 1 ms no p99, dentro do serviço.
+
+![O painel do Grafana. No alto: 85 Pix por segundo, 0,14% segurados, 0,02% bloqueados, a decisão em 1 ms no p99 e a versão 2 do modelo. Embaixo, o ciclo de cada dia nos aprovados, nos segurados e bloqueados, no tempo da decisão, no dinheiro segurado, na resposta do cliente, na chance de golpe dos aprovados e nas contestações.](docs/imagens/painel.png)
+
 ## Roteiro
 
 O projeto é construído em partes, cada uma entregue funcionando, testada e documentada.
@@ -321,7 +363,7 @@ O projeto é construído em partes, cada uma entregue funcionando, testada e doc
 | 5 | Os experimentos rastreados no MLflow, o modelo registrado com a sua ficha, e o mesmo processo numa base pública real, de cartões | ✅ |
 | 6 | A pontuação em tempo real: a API em FastAPI, a latência medida, e o teste de que a API e o treino calculam as mesmas variáveis | ✅ |
 | 7 | O monitoramento: os dados que mudam, o rótulo que chega depois, o golpe novo, e o retreino comparando o modelo atual com o candidato | ✅ |
-| 8 | Docker, entrega contínua, OpenTelemetry e o painel | |
+| 8 | Docker, entrega contínua, OpenTelemetry e o painel | ✅ |
 
 ## O que já está pronto
 
@@ -405,6 +447,16 @@ O projeto é construído em partes, cada uma entregue funcionando, testada e doc
 - **O retreino**: o desafiante contra o campeão, nos mesmos Pix, com o rótulo que o banco tem. Ele ganha pela precisão média, pelo custo e sem bloquear mais os mais velhos.
 - **O registro com dois apelidos**: o desafiante entra com o dele, o veredito fica na versão, e o de campeão só passa a ele quando ele ganha.
 
+**Parte 8 — a entrega, a telemetria e o painel**
+
+- **A telemetria do OpenTelemetry**: o traço de cada pedido, com as etapas, o que continua o do banco, e as oito métricas do serviço. Nada que identifique alguém sai, e a telemetria própria do FastAPI fica desligada.
+- **O campeão empacotado**: o modelo do registro numa pasta que roda em qualquer máquina, com o caminho do código consertado para o Linux.
+- **A reprodução**: os eventos do banco mandados à API no ritmo deles, com o cliente que confirma ou recusa o Pix segurado.
+- **A imagem Docker**: dois estágios, o `uv.lock` sem as ferramentas de desenvolvimento, um usuário sem poder, a saúde conferida e as bases fixadas pelo digest.
+- **O `compose`**: o serviço, o coletor com a segunda barreira do dado pessoal, o Prometheus, o Jaeger e o Grafana.
+- **A entrega contínua**: a fumaça da imagem a cada commit, e a publicação no GitHub Container Registry a cada push para a `main`.
+- **O painel**: os números de agora, as decisões, o tempo de cada etapa, o dinheiro segurado e a resposta do cliente, vindo do repositório.
+
 ## Decisões
 
 As decisões que mudam o desenho do projeto estão registradas em [`docs/adr`](docs/adr):
@@ -430,6 +482,10 @@ As decisões que mudam o desenho do projeto estão registradas em [`docs/adr`](d
 - [ADR-0019](docs/adr/0019-a-virada-o-golpe-novo.md) — a virada: o golpe novo.
 - [ADR-0020](docs/adr/0020-a-deriva-e-o-rotulo-que-chega-depois.md) — a deriva, e o rótulo que chega depois.
 - [ADR-0021](docs/adr/0021-o-retreino-campeao-contra-desafiante.md) — o retreino: o campeão contra o desafiante.
+- [ADR-0022](docs/adr/0022-a-telemetria-sem-dado-pessoal.md) — a telemetria sem dado pessoal.
+- [ADR-0023](docs/adr/0023-o-campeao-empacotado.md) — o campeão empacotado.
+- [ADR-0024](docs/adr/0024-a-reproducao.md) — a reprodução: os eventos do banco no ritmo dele.
+- [ADR-0025](docs/adr/0025-a-imagem-a-entrega-e-o-painel.md) — a imagem, a entrega contínua e o painel.
 
 ## Testes
 
@@ -551,6 +607,19 @@ As decisões que mudam o desenho do projeto estão registradas em [`docs/adr`](d
   - o que ordena melhor mas segura os honestos custa mais;
   - o bloqueio dos mais velhos pesa a partir do quinto honesto bloqueado só por ele, e não pesa com os mais novos.
 - **O registro com dois apelidos**: o desafiante entra sem tirar o campeão, o carregado pontua como o treinado no mesmo corte, e só a promoção passa o apelido.
+- **A telemetria, pelos exportadores em memória do OpenTelemetry**:
+  - o traço de cada Pix, com as duas etapas, e o id dele na resposta;
+  - o traço que continua o do banco, e o pedido recusado só pelo código;
+  - as métricas de cada ação, do dinheiro, da espera e da resposta do cliente;
+  - em trinta Pix com todos os tipos de pedido, nenhum atributo fora da lista e nenhum id, chave ou valor;
+  - com os provedores globais, como no contêiner, só a telemetria do serviço sai.
+- **O pacote**: ele decide igual ao modelo do mesmo corte depois de apagados os artefatos do registro. O caminho do código vira o nome, venha de Windows ou de Linux, e empacotar de novo troca o pacote inteiro.
+- **A reprodução**: cada evento chega à API, a vítima recusa e o honesto confirma, a parte que recusa sai da semente, o ritmo é o do banco vezes a velocidade, e o placar dos dias soma o do período.
+- **A implantação conferida contra o código**:
+  - o painel consulta todas as métricas do serviço, e só pelos atributos da telemetria;
+  - a lista do coletor é a da telemetria;
+  - o comando da imagem e o do `compose` existem na linha de comando;
+  - cada imagem é fixada pelo digest.
 - **A linha de comando e as figuras**: o que sai, o que é recusado, e as figuras gravadas.
 
 ## Como rodar
@@ -645,6 +714,50 @@ O desafiante, treinado em 17 de novembro, contra o campeão, nos Pix das duas se
 uv run antifraude-pix retreinar dados-virada --ate 2025-12-01
 ```
 
+O campeão empacotado para ir ao ar, em `dados/campeao`, sem depender do registro do MLflow:
+
+```bash
+uv run antifraude-pix empacotar
+```
+
+O serviço no Docker, com o coletor do OpenTelemetry, o Prometheus, o Jaeger e o Grafana. A API sobe com a história até 1º de dezembro, em uns 60 s, e precisa de uns 3 GB de memória. O painel fica em http://127.0.0.1:3000, e os traços, em http://127.0.0.1:16686:
+
+```bash
+docker compose up --build -d
+```
+
+Os eventos de dezembro mandados à API, 600 vezes mais depressa que o banco: um dia passa em uns dois minutos e meio:
+
+```bash
+uv run antifraude-pix reproduzir http://127.0.0.1:8000 --de 2025-12-01
+```
+
+O mesmo com o golpe novo, depois de `antifraude-pix empacotar dados-virada`. No PowerShell, as variáveis vão antes, cada uma no seu comando:
+
+```powershell
+$env:DADOS = "./dados-virada"
+```
+
+```powershell
+docker compose up --build -d
+```
+
+A fumaça da imagem, a mesma do CI, no Git Bash ou no Linux:
+
+```bash
+bash implantacao/fumaca.sh
+```
+
+A latência com a telemetria indo para o coletor do `compose`:
+
+```powershell
+$env:OTEL_EXPORTER_OTLP_ENDPOINT = "http://127.0.0.1:4318"
+```
+
+```powershell
+uv run antifraude-pix latencia
+```
+
 O MLflow mostra as corridas no navegador, em http://127.0.0.1:5000:
 
 ```bash
@@ -727,7 +840,10 @@ src/antifraude_pix/
   tempo_real/
     estado.py           o estado do banco, Pix a Pix: as variáveis de um Pix, iguais às do treino
     servico.py          a API em FastAPI que decide cada Pix
+    telemetria.py       os traços e as métricas do OpenTelemetry, sem dado pessoal
+    pacote.py           o campeão empacotado, que roda sem o registro do MLflow
     latencia.py         a latência medida, por dentro e pela API
+    reproducao.py       os eventos do banco mandados à API, no ritmo deles
   monitoramento/
     deriva.py           o índice de estabilidade da população, de cada variável e da probabilidade
     rotulo.py           a curva de chegada do rótulo, e a perda esperada contra a conhecida
@@ -746,12 +862,19 @@ src/antifraude_pix/
     separacao.py        a força de cada variável, sozinha, contra cada golpe
     figuras.py          as figuras do README
   cli.py                antifraude-pix simular, validar, variaveis, avaliar, decidir, experimentos, registrar, cartoes, servir,
-                        latencia, monitorar e retreinar
+                        latencia, empacotar, reproduzir, monitorar e retreinar
+implantacao/
+  coletor.yaml          o coletor do OpenTelemetry, com a lista dos atributos que passam
+  prometheus.yml        o Prometheus, que lê as métricas do coletor
+  grafana/              a fonte, o provisionamento e o painel
+  fumaca.sh             a fumaça da imagem, a mesma do CI
+Dockerfile              a imagem do serviço, em dois estágios
+compose.yaml            o serviço, o coletor, o Prometheus, o Jaeger e o Grafana
 tests/                  o simulador, os dados, as variáveis, os modelos, a avaliação, a decisão, o rastreio, os cartões, o serviço,
-                        o monitoramento e as análises
+                        o monitoramento, as análises e a implantação
 docs/adr/               decisões de arquitetura
 docs/ficha-do-modelo.md a ficha do modelo registrado
-docs/imagens/           as figuras do retrato, da força das variáveis, dos modelos, da decisão, dos cartões e do monitor
+docs/imagens/           as figuras do retrato, da força das variáveis, dos modelos, da decisão, dos cartões, do monitor e do painel
 ```
 
 ## Licença

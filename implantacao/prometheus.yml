@@ -1,0 +1,10 @@
+# O Prometheus lê as métricas do serviço no coletor, a cada cinco segundos:
+# o mesmo intervalo em que a API as manda (ADR-0025).
+global:
+  scrape_interval: 5s
+  evaluation_interval: 5s
+
+scrape_configs:
+  - job_name: coletor
+    static_configs:
+      - targets: ["coletor:8889"]

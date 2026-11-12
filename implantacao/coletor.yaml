@@ -1,0 +1,47 @@
+# O coletor do OpenTelemetry (ADR-0025): recebe da API os traços e as
+# métricas, pelo OTLP em HTTP; manda os traços ao Jaeger e deixa as métricas
+# para o Prometheus ler.
+#
+# O `transform` é a segunda barreira do dado pessoal: o serviço já não manda
+# nada que identifique alguém (ADR-0022), e o coletor apaga de cada span
+# qualquer atributo fora desta lista. O recurso, com o nome e a versão do
+# serviço, fica como está. Um teste confere que a lista é a mesma de
+# `telemetria.ATRIBUTOS`.
+
+receivers:
+  otlp:
+    protocols:
+      http:
+        endpoint: 0.0.0.0:4318
+
+processors:
+  memory_limiter:
+    check_interval: 1s
+    limit_mib: 400
+  transform/so_a_lista:
+    error_mode: ignore
+    trace_statements:
+      - >-
+        keep_keys(span.attributes, ["error.type", "etapa", "http.response.status_code", "modelo.versao",
+        "pedido", "pix.acao", "pix.confirmado", "pix.faixa_de_valor", "pix.iniciacao", "pix.probabilidade",
+        "pix.recebedor_pessoa"])
+  batch: {}
+
+exporters:
+  otlp_grpc/jaeger:
+    endpoint: jaeger:4317
+    tls:
+      insecure: true
+  prometheus:
+    endpoint: 0.0.0.0:8889
+
+service:
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [memory_limiter, transform/so_a_lista, batch]
+      exporters: [otlp_grpc/jaeger]
+    metrics:
+      receivers: [otlp]
+      processors: [memory_limiter, batch]
+      exporters: [prometheus]

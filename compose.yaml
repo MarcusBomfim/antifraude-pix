@@ -1,0 +1,77 @@
+# O serviço e o que o observa, numa máquina só (ADR-0025):
+# - api: a imagem do serviço, com a pasta dos dados só para leitura;
+# - coletor: recebe da API os traços e as métricas, pelo OTLP;
+# - prometheus: guarda as métricas, que lê do coletor;
+# - jaeger: guarda e mostra os traços;
+# - grafana: o painel, em http://127.0.0.1:3000.
+#
+# A pasta dos dados precisa do pacote do campeão: `antifraude-pix empacotar`.
+# Por padrão, o estado sobe com a história até 1º de dezembro, e o resto
+# chega pela reprodução: `antifraude-pix reproduzir http://127.0.0.1:8000
+# --de 2025-12-01`. DADOS e ATE mudam a pasta e o dia.
+#
+# As portas abrem só para a própria máquina (127.0.0.1): o Grafana deixa ver
+# o painel sem senha, e nada aqui é para a rede.
+
+name: antifraude-pix
+
+services:
+  api:
+    build: .
+    image: antifraude-pix:local
+    command: ["servir", "/dados", "--pacote", "/dados/campeao", "--host", "0.0.0.0", "--ate", "${ATE:-2025-12-01}"]
+    volumes:
+      - ${DADOS:-./dados}:/dados:ro
+    environment:
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://coletor:4318
+      OTEL_SERVICE_NAME: antifraude-pix
+      # Um traço a cada dez pedidos, a não ser que o banco mande o dele: com todos, o p99 da ida e volta dobra.
+      # As métricas contam todos os Pix.
+      OTEL_TRACES_SAMPLER: parentbased_traceidratio
+      OTEL_TRACES_SAMPLER_ARG: "0.1"
+    ports:
+      - 127.0.0.1:8000:8000
+    depends_on:
+      - coletor
+
+  coletor:
+    image: otel/opentelemetry-collector-contrib:0.164.0@sha256:340c9ca6a36617084c6661bdc4f0fe92b7cda5a805d61673ec8db375fddc522b
+    command: ["--config=/etc/coletor/coletor.yaml"]
+    volumes:
+      - ./implantacao/coletor.yaml:/etc/coletor/coletor.yaml:ro
+    ports:
+      # Aberta para a máquina também: a medida da latência, fora do Docker, manda a telemetria por ela.
+      - 127.0.0.1:4318:4318
+    depends_on:
+      - jaeger
+
+  prometheus:
+    image: prom/prometheus:v3.15.1@sha256:fa3302279710be2f21a8301ec17a8b4f2301fd829bd113839b3b6b02b6f191a2
+    command: ["--config.file=/etc/prometheus/prometheus.yml", "--storage.tsdb.retention.time=2d"]
+    volumes:
+      - ./implantacao/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    ports:
+      - 127.0.0.1:9090:9090
+
+  jaeger:
+    image: jaegertracing/jaeger:2.22.0@sha256:836b967b5abcf1f7758066aa6b348619267a2f1459f72d472840570f9bd88a17
+    ports:
+      - 127.0.0.1:16686:16686
+
+  grafana:
+    image: grafana/grafana:13.2.5@sha256:9f7aa1e1e3246aade5792d35a738049f7f32f89cd51d1956cf426a4e86268a84
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /var/lib/grafana/paineis/painel.json
+      GF_NEWS_NEWS_FEED_ENABLED: "false"
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+    volumes:
+      - ./implantacao/grafana/fontes.yaml:/etc/grafana/provisioning/datasources/fontes.yaml:ro
+      - ./implantacao/grafana/paineis.yaml:/etc/grafana/provisioning/dashboards/paineis.yaml:ro
+      - ./implantacao/grafana/painel.json:/var/lib/grafana/paineis/painel.json:ro
+    ports:
+      - 127.0.0.1:3000:3000
+    depends_on:
+      - prometheus

@@ -1,0 +1,12 @@
+# A fonte do painel: o Prometheus do compose, com o uid que o painel.json usa.
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    uid: prometheus
+    type: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true
+    jsonData:
+      timeInterval: 5s
